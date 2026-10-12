@@ -111,6 +111,8 @@ class Shift(Base):
     slot_start: Mapped[datetime | None] = mapped_column(UTCDateTime, nullable=True, index=True)
     custom_period: Mapped[bool] = mapped_column(Boolean, default=False)
     cancelled: Mapped[bool] = mapped_column(Boolean, default=False)  # смена по графику снята вручную: дни без дежурства
+    # ручное дежурство на период (set_period): заменяет график в этом периоде и засчитывается в очередь
+    rotation_credit: Mapped[bool] = mapped_column(Boolean, default=False)
 
     # Публикация во внешний календарь (Exchange и т.п.): одно событие на смену, все дежурные — участники
     external_id: Mapped[str | None] = mapped_column(String(512), nullable=True)

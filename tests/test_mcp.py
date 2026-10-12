@@ -40,6 +40,13 @@ def test_mcp_tools(team, service):
             plan = _data(await c.call_tool("replan", {"team": "sec", "mode": "rebalance"}))
             assert plan["dry_run"] is True
 
+            batch = _data(await c.call_tool("plan_batch", {"operations": [
+                {"op": "set_period", "team": "sec", "start": "2026-10-20", "end": "2026-10-22", "emails": ["a@x.ru"]},
+            ]}))
+            assert batch["dry_run"] is True and batch["changes"]
+            per = _data(await c.call_tool("set_period", {"team": "sec", "start": "2026-10-20", "end": "2026-10-22"}))
+            assert per["dry_run"] is True and per["people"] == []
+
             err = await c.call_tool("assign_shift", {"shift_id": 99999, "email": "a@x.ru"}, raise_on_error=False)
             assert err.is_error
 

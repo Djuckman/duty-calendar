@@ -337,5 +337,79 @@ def test_migration_drops_shift_unique_and_keeps_assignments(tmp_path):
     con = sqlite3.connect(path)
     assert con.execute("SELECT count(*) FROM shift_assignments").fetchone() == (1,)
     con.execute("INSERT INTO shifts (id, team_id, start, \"end\", deleted, publish_dirty, manual, custom_period, cancelled, "
-                "updated_at) VALUES (2, 1, '2026-10-12 07:00:00', '2026-10-13 07:00:00', 0, 0, 1, 0, 0, '2026-10-01')")  # тот же start — теперь можно
+                "rotation_credit, updated_at) "
+                "VALUES (2, 1, '2026-10-12 07:00:00', '2026-10-13 07:00:00', 0, 0, 1, 0, 0, 0, '2026-10-01')")  # тот же start — теперь можно
     con.commit()
+
+
+def _setup_ops2(admin, service, clock):
+    clock.now = datetime(2026, 10, 12, 18, 26, tzinfo=UTC)
+    with service.write() as op:
+        service.sync_holidays(op, [2026])
+    admin.post("/api/v1/teams", json={"slug": "ops2", "shift_length_days": 2, "weekdays": "12345",
+                                      "skip_holidays": True, "handoff_time": "11:00", "anchor_date": "2026-10-12",
+                                      "horizon_days": 35}).raise_for_status()
+    for login in ["djuckman", "roma", "egor", "enot"]:
+        admin.post("/api/v1/teams/ops2/members", json={"email": f"{login}@x.ru", "name": login}).raise_for_status()
+
+
+def test_batch_period_nobody_then_enot_then_auto(admin, service, clock, notifier):
+    _setup_ops2(admin, service, clock)
+    before = _rows(admin, "ops2", start="2026-10-12T00:00:00Z", end="2026-11-15T00:00:00Z")
+    ops = [
+        {"op": "set_period", "team": "ops2", "start": "2026-10-14", "end": "2026-10-20", "replan": "none"},
+        {"op": "set_period", "team": "ops2", "start": "2026-10-21", "end": "2026-10-23", "emails": ["enot@x.ru"]},
+    ]
+    r = admin.post("/api/v1/batch", json={"operations": ops, "dry_run": True})
+    assert r.status_code == 200, r.text
+    assert r.json()["changes"] and len(r.json()["results"]) == 2
+    assert _rows(admin, "ops2", start="2026-10-12T00:00:00Z", end="2026-11-15T00:00:00Z") == before  # ничего не сохранено
+
+    notifier.messages.clear()
+    r = admin.post("/api/v1/batch", json={"operations": ops, "dry_run": False})
+    assert r.status_code == 200, r.text
+    assert len(notifier.messages) == 1  # одно сообщение на канал
+
+    rows = _rows(admin, "ops2", start="2026-10-12T00:00:00Z", end="2026-11-15T00:00:00Z")
+    msk = ZoneInfo("Europe/Moscow")
+    # 14–20 октября никто не дежурит
+    assert not [x for x in rows if "14.10" <= x[0] <= "20.10" and x[0][3:] == "10"]
+    # 21–23 — только enot, это период
+    period = [x for x in rows if x[0] == "21.10"]
+    assert [p[2] for p in period] == [["enot"]] and period[0][1] == "24.10"
+    # дальше ротация без наложений, и enot не ставится сразу после своего периода
+    after = [x for x in rows if x[0] >= "26.10" or x[0][3:] == "11"]
+    assert after[0][0] == "26.10" and after[0][2] != ["enot"]
+    seq = [x for x in rows if not x[3] or x[0] == "21.10"]
+    shifts = admin.get("/api/v1/shifts", params={"team": "ops2", "start": "2026-10-12T00:00:00Z",
+                                                 "end": "2026-11-15T00:00:00Z"}).json()
+    iv = sorted((datetime.fromisoformat(s["start"]), datetime.fromisoformat(s["end"])) for s in shifts)
+    assert all(e1 <= s2 for (_, e1), (s2, _) in zip(iv, iv[1:])), iv
+    assert seq
+
+
+def test_set_period_splits_covering_shift(team, admin):
+    # неделя 12.10–19.10 у Бори; на 14–15 ставим Вику
+    r = admin.post("/api/v1/teams/sec/period", json={"start": "2026-10-14", "end": "2026-10-15",
+                                                     "emails": ["c@x.ru"], "replan": "none"})
+    assert r.status_code == 200, r.text
+    assert r.json()["split"] == 1
+    rows = [x[:3] for x in _rows(admin, "sec", end="2026-10-18T00:00:00Z")][1:]
+    assert rows == [("12.10", "14.10", ["Боря"]), ("14.10", "16.10", ["Вика"]), ("16.10", "19.10", ["Боря"])]
+
+
+def test_set_period_dry_run_and_errors(team, admin):
+    r = admin.post("/api/v1/teams/sec/period", params={"dry_run": True},
+                   json={"start": "2026-10-20", "end": "2026-10-21"})
+    assert r.status_code == 200 and r.json()["dry_run"] is True
+    assert {c["action"] for c in r.json()["changes"]} == {"changed", "added"}  # неделя Вики делится
+    assert not [x for x in _rows(admin, "sec") if x[3]]  # ничего не сохранено
+    r = admin.post("/api/v1/batch", json={"operations": [{"op": "nope"}], "dry_run": True})
+    assert r.status_code == 422 and "неизвестная операция" in r.json()["detail"]
+    r = admin.post("/api/v1/batch", json={"operations": [
+        {"op": "set_period", "team": "sec", "start": "2026-10-20", "end": "2026-10-21"},
+        {"op": "delete_shift", "shift_id": 999999}], "dry_run": False})
+    assert r.status_code == 404 and "операция 2" in r.json()["detail"]
+    # всё или ничего: первая операция тоже не применилась
+    cal = admin.get("/api/v1/calendar", params={"start": "2026-10-19T00:00:00Z", "end": "2026-10-23T00:00:00Z"}).json()
+    assert cal["cancelled"] == []

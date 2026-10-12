@@ -66,6 +66,9 @@ class ExistingShift:
     start: datetime
     end: datetime
     seats: tuple[ExistingSeat, ...] = ()
+    # реальные даты, если они изменены вручную (start/end выше — слот сетки, по нему идёт сопоставление)
+    real_start: datetime | None = None
+    real_end: datetime | None = None
 
     @classmethod
     def single(cls, id: int, start: datetime, end: datetime, person_id: int | None, pinned: bool = False):
@@ -84,6 +87,9 @@ class PlanInput:
     duty_count: dict[int, int] = field(default_factory=dict)  # сколько смен было за период истории
     mode: Mode = "fix"
     freeze_until: datetime | None = None  # rebalance не трогает смены, начинающиеся раньше
+    # Дежурства вне сетки, которые засчитываются в очередь (ручной период): планировщик их не меняет,
+    # но учитывает при выборе «кто дольше всех не дежурил».
+    fixed: list[ExistingShift] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------- результат
@@ -228,9 +234,28 @@ class WholeShiftPlanner(BasePlanner):
             if e.start not in items and (e.start <= now or any(s.pinned for s in e.seats)):
                 items[e.start] = (Slot(e.start, e.end), e, False)
 
+        # вне-сеточные дежурства, засчитываемые в очередь: учитываем в LRU в хронологическом порядке
+        fixed = sorted(data.fixed, key=lambda f: f.start)
+        fi = 0
+
+        def credit_fixed(until: datetime) -> None:
+            nonlocal fi
+            while fi < len(fixed) and fixed[fi].start <= until:
+                for st in fixed[fi].seats:
+                    if st.person_id is not None:
+                        last[st.person_id] = max(last.get(st.person_id, EPOCH), fixed[fi].start)
+                        count[st.person_id] = count.get(st.person_id, 0) + 1
+                fi += 1
+
         for start in sorted(items):
+            credit_fixed(start)
             slot, ex, on_grid = items[start]
             end = slot.end if on_grid else ex.end  # при смене длины ротации конец берём из новой сетки
+            if ex is not None and ex.real_start is not None:  # даты смены изменены вручную
+                start_slot = start
+                start, end = ex.real_start, ex.real_end
+            else:
+                start_slot = start
             started = start <= now
             frozen = data.freeze_until is not None and start < data.freeze_until
             old_seats = {s.seat: s for s in (ex.seats if ex else ())}
@@ -302,7 +327,8 @@ class WholeShiftPlanner(BasePlanner):
                 group_people[slot.group] = [planned[k].person_id for k in sorted(planned)
                                             if planned[k].person_id is not None]
             res.shifts.append(
-                PlannedShift(start, end, ex.id if ex else None, [planned[k] for k in sorted(planned)])
+                PlannedShift(start_slot, slot.end if on_grid else end, ex.id if ex else None,
+                             [planned[k] for k in sorted(planned)])
             )
 
         return res

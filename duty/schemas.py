@@ -122,6 +122,7 @@ class ShiftOut(BaseModel):
     people_per_shift: int
     manual: bool = False
     custom_period: bool = False  # даты смены по графику изменены вручную
+    rotation_credit: bool = False  # дежурство на период (заменяет график, засчитывается в очередь)
     slot_start: datetime | None = None
     seats: list[SeatOut]
 
@@ -136,6 +137,7 @@ def shift_out(sh: Shift) -> ShiftOut:
         people_per_shift=sh.team.people_per_shift,
         manual=sh.manual,
         custom_period=sh.custom_period,
+        rotation_credit=sh.rotation_credit,
         slot_start=sh.slot_start,
         seats=[
             SeatOut(seat=a.seat, person=PersonOut.model_validate(a.person) if a.person else None, pinned=a.pinned)
@@ -155,6 +157,54 @@ class ManualShiftIn(BaseModel):
     days: int = Field(1, ge=1, le=366, description="Сколько календарных дней")
     emails: list[str] = Field(description="Кто дежурит (один или несколько)")
     force: bool = Field(False, description="Назначить, даже если кто-то отсутствует")
+
+
+class PeriodIn(BaseModel):
+    start: str = Field(description="YYYY-MM-DD (с передачи смены в этот день) или ISO 8601")
+    end: str = Field(description="YYYY-MM-DD (включительно) или ISO 8601 (не включительно)")
+    emails: list[str] = Field(default_factory=list, description="Кто дежурит весь период; пусто — никто")
+    force: bool = False
+    replan: Literal["rebalance", "fix", "none"] = "rebalance"
+
+
+class DiffSide(BaseModel):
+    start: datetime
+    end: datetime
+    people: list[str | None]
+    kind: str  # график | ручное | период
+
+
+class DiffItem(BaseModel):
+    shift_id: int
+    team: str
+    team_name: str
+    action: str  # added | removed | changed
+    before: DiffSide | None
+    after: DiffSide | None
+
+
+class PeriodResult(BaseModel):
+    dry_run: bool
+    period_shift_id: int | None
+    start: datetime
+    end: datetime
+    people: list[str]
+    cancelled: int
+    trimmed: int
+    split: int
+    removed_manual: int
+    changes: list[DiffItem]
+
+
+class BatchIn(BaseModel):
+    operations: list[dict] = Field(description="Список операций: {op: <имя>, ...параметры}")
+    dry_run: bool = True
+
+
+class BatchResult(BaseModel):
+    dry_run: bool
+    results: list[str]
+    changes: list[DiffItem]
 
 
 class ShiftPeriodIn(BaseModel):

@@ -283,6 +283,22 @@ def create_manual_shift(slug: str, data: S.ManualShiftIn, user: CurrentUser, svc
         return S.shift_out(svc.create_manual_shift(op, slug, data.start_date, data.days, data.emails, data.force))
 
 
+@router.post("/teams/{slug}/period", response_model=S.PeriodResult, tags=["shifts"])
+def set_period(slug: str, data: S.PeriodIn, user: CurrentUser, svc: Svc, dry_run: bool = False):
+    """Заменить график на период: «в эти дни дежурят такие-то» или «никто не дежурит» (emails=[]).
+    Смены внутри периода снимаются, на границах обрезаются; остальной график перепланируется."""
+    with svc.write(user) as op:
+        return S.PeriodResult(**svc.set_period_preview(op, slug, data.start, data.end, data.emails, data.force,
+                                                       data.replan, dry_run))
+
+
+@router.post("/batch", response_model=S.BatchResult, tags=["shifts"])
+def run_batch(data: S.BatchIn, user: CurrentUser, svc: Svc):
+    """Несколько операций в одной транзакции (всё или ничего) с общим предпросмотром (dry_run, по умолчанию)."""
+    with svc.write(user) as op:
+        return S.BatchResult(**svc.run_batch(op, data.operations, data.dry_run))
+
+
 @router.patch("/shifts/{shift_id}", response_model=S.ShiftOut, tags=["shifts"])
 def set_shift_period(shift_id: int, data: S.ShiftPeriodIn, user: CurrentUser, svc: Svc):
     """Изменить даты дежурства (у смены по графику ротация дальше не сдвигается)."""

@@ -257,7 +257,7 @@ function toEvents(data) {
       const p = seat.person;
       const cls = [];
       if (seat.pinned) cls.push("ev-pinned");
-      if (sh.manual) cls.push("ev-manual");
+      if (sh.manual && !sh.rotation_credit) cls.push("ev-manual");
       if (!p || absencesOf(p.id, sh.start, sh.end).length) cls.push("ev-problem");
       if (state.swap && state.swap.shift.id === sh.id && state.swap.seat === i) cls.push("ev-selecting");
       const color = !p && state.colorMode === "person" ? "#c4314b" : dutyColor(sh, p);
@@ -286,7 +286,11 @@ function toEvents(data) {
       extendedProps: { type: "event", event: ev },
     });
   }
+  const periods = data.shifts.filter((x) => x.rotation_credit);
   for (const sh of data.cancelled || []) {
+    // снятые смены, которые заменены дежурством на период, не показываем — это не «дни без дежурства»
+    const covered = periods.some((p) => p.team === sh.team && new Date(p.start) <= new Date(sh.start) && new Date(p.end) >= new Date(sh.end));
+    if (covered) continue;
     events.push({
       id: "c" + sh.id, title: `снято: ${sh.seats.map((x) => x.person?.name).filter(Boolean).join(", ") || "дежурство"}`,
       start: sh.start, end: sh.end, classNames: ["ev-cancelled"], display: "block",
@@ -401,7 +405,8 @@ async function openShift(shiftId) {
   }
   const problems = shiftProblems(sh);
   const body = openDialog(`${sh.team_name}: ${sh.manual ? "ручное дежурство" : "дежурство по графику"}`, `
-    ${sh.manual ? `<p class="muted">✋ Ручное дежурство — отдельный слой поверх графика ротации.</p>` : ""}
+    ${sh.manual && !sh.rotation_credit ? `<p class="muted">✋ Ручное дежурство — отдельный слой поверх графика ротации.</p>` : ""}
+    ${sh.rotation_credit ? `<p class="muted">🗓 Дежурство на период: заменяет график в эти дни и засчитывается в очередь.</p>` : ""}
     ${sh.custom_period ? `<p class="muted">Даты этой смены изменены вручную (по графику начиналась ${esc(fmt.format(new Date(sh.slot_start)))}). Остальной график не сдвигается.</p>` : ""}
     ${past ? `<p class="muted">Смена уже прошла — только просмотр.</p>` : ""}
     <div class="grid2">
@@ -676,8 +681,11 @@ function openCreate(startDate, days, teamSlug, kind = "duty") {
   const teams = state.teams.filter((t) => state.selected.has(t.slug));
   let team = teamBySlug(teamSlug) || teams[0];
   const tabs = `<div class="tabs">
-      <label class="inline"><input type="radio" name="cr-kind" value="duty" ${kind === "duty" ? "checked" : ""}> Дежурство</label>
+      <label class="inline"><input type="radio" name="cr-kind" value="duty" ${kind === "duty" ? "checked" : ""}> Дежурство поверх</label>
+      <label class="inline"><input type="radio" name="cr-kind" value="period" ${kind === "period" ? "checked" : ""}> Заменить график</label>
       <label class="inline"><input type="radio" name="cr-kind" value="event" ${kind === "event" ? "checked" : ""}> Событие</label></div>`;
+
+  if (kind === "period") return openPeriod(tabs, startDate, days, teams, team, teamSlug);
 
   if (kind === "event") {
     const body = openDialog("Добавить в календарь", tabs + eventFields(null, startDate, days), [
@@ -737,6 +745,72 @@ function openCreate(startDate, days, teamSlug, kind = "duty") {
   render();
 }
 const openManualShift = (d, n, t) => openCreate(d, n, t, "duty");
+
+function renderDiff(changes) {
+  if (!changes.length) return `<p class="muted">Изменений нет.</p>`;
+  const who = (side) => (side.people.filter(Boolean).join(", ") || "никто");
+  const kindLabel = { "график": "", "ручное": " · ручное", "период": " · период" };
+  return `<ul class="changes">${changes.map((c) => {
+    if (c.action === "added") return `<li>＋ ${esc(range(c.after.start, c.after.end))}: <b>${esc(who(c.after))}</b><span class="muted">${kindLabel[c.after.kind] || ""}</span></li>`;
+    if (c.action === "removed") return `<li class="warn">− ${esc(range(c.before.start, c.before.end))}: ${esc(who(c.before))} — снято</li>`;
+    const dates = c.before.start !== c.after.start || c.before.end !== c.after.end
+      ? `${esc(range(c.before.start, c.before.end))} → ${esc(range(c.after.start, c.after.end))}` : esc(range(c.after.start, c.after.end));
+    const ppl = who(c.before) !== who(c.after) ? `${esc(who(c.before))} → <b>${esc(who(c.after))}</b>` : esc(who(c.after));
+    return `<li>~ ${dates}: ${ppl}</li>`;
+  }).join("")}</ul>`;
+}
+
+function openPeriod(tabs, startDate, days, teams, team, teamSlug) {
+  if (!teams.length) return toast("Выберите команду слева", true);
+  const body = openDialog("Заменить график на период", tabs + `
+    <label>Команда<select id="pd-team">${teams.map((t) => `<option value="${esc(t.slug)}" ${t.slug === team.slug ? "selected" : ""}>${esc(t.name)}</option>`).join("")}</select></label>
+    <div class="grid2">
+      <label>С (включительно)<input type="date" id="pd-start" value="${startDate}"></label>
+      <label>По (включительно)<input type="date" id="pd-end" value="${addDays(startDate, days - 1)}"></label>
+    </div>
+    <div><span class="muted">Кто дежурит весь период (никого не отметить — дни без дежурства):</span><div id="pd-people" class="people-pick"></div></div>
+    <label>Остальной график<select id="pd-replan">
+      <option value="rebalance">перебалансировать (ротация продолжится ровно после периода)</option>
+      <option value="fix">исправить только сломанное</option>
+      <option value="none">не трогать</option></select></label>
+    <p class="muted">Смены по графику внутри периода снимаются, на границах — обрезаются. Дежурство на период засчитывается в очередь.</p>
+    <div id="pd-preview"></div>`, [
+    { text: "Что изменится?", onClick: () => guard(async () => {
+      const r = await api("POST", `/teams/${$("#pd-team").value}/period`, payload(), { dry_run: true });
+      $("#pd-preview").innerHTML = renderDiff(r.changes);
+    }) },
+    { text: "Применить", cls: "primary", onClick: () => guard(async () => {
+      let r;
+      try {
+        r = await api("POST", `/teams/${$("#pd-team").value}/period`, payload());
+      } catch (e) {
+        if (e.status === 409 && /force/.test(e.message) && await askConfirm(e.message.replace(/Чтобы.*/, "") + "\n\nПрименить всё равно?", "Применить")) {
+          r = await api("POST", `/teams/${$("#pd-team").value}/period`, { ...payload(), force: true });
+        } else throw e;
+      }
+      refresh();
+      openDialog("Период задан", renderDiff(r.changes), [{ text: "OK", cls: "primary", onClick: closeDialog }]);
+    }) },
+  ]);
+  const payload = () => ({
+    start: $("#pd-start").value, end: $("#pd-end").value, replan: $("#pd-replan").value, force: false,
+    emails: [...body.querySelectorAll(".pd-p:checked")].map((c) => c.value),
+  });
+  body.querySelectorAll("[name=cr-kind]").forEach((r) => r.onchange = () => openCreate(startDate, days, teamSlug, r.value));
+  const render = () => {
+    const t = teamBySlug($("#pd-team").value);
+    const st = new Date($("#pd-start").value + "T00:00:00"), en = new Date(addDays($("#pd-end").value, 1) + "T00:00:00");
+    $("#pd-people").innerHTML = t.members.map((m) => {
+      const person = state.people.find((p) => p.email === m.email);
+      const away = person && absencesOf(person.id, st, en).length;
+      return `<label class="inline"><input type="checkbox" class="pd-p" value="${esc(m.email)}">
+        <span><span class="team-dot" style="background:${person ? personColor(person.id) : "#999"}"></span>${esc(m.name)}${away ? ' <span class="muted">· отсутствует</span>' : ""}</span></label>`;
+    }).join("") || `<p class="muted">В команде пока никого нет.</p>`;
+  };
+  $("#pd-team").addEventListener("change", render);
+  linkDates($("#pd-start"), $("#pd-end"));
+  render();
+}
 
 function openEvent(ev) {
   setTimeout(() => bindEventPeople(ev));

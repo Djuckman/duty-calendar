@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.orm import Session, selectinload
 
 from . import auth
@@ -701,8 +701,20 @@ class DutyService:
         shifts = [sh for sh in rows if not sh.cancelled and (sh.end > now or sh.custom_period)]
         existing = [
             ExistingShift(sh.id, sh.slot_start or sh.start, sh.end,
-                          tuple(ExistingSeat(a.seat, a.person_id, a.pinned) for a in sh.assignments))
+                          tuple(ExistingSeat(a.seat, a.person_id, a.pinned) for a in sh.assignments),
+                          real_start=sh.start if sh.custom_period else None,
+                          real_end=sh.end if sh.custom_period else None)
             for sh in shifts
+        ]
+        # ручные дежурства «на период» засчитываются в очередь
+        fixed = [
+            ExistingShift(sh.id, sh.start, sh.end,
+                          tuple(ExistingSeat(a.seat, a.person_id, True) for a in sh.assignments))
+            for sh in s.scalars(
+                select(Shift).options(selectinload(Shift.assignments))
+                .where(Shift.team_id == team.id, Shift.deleted.is_(False), Shift.manual.is_(True),
+                       Shift.rotation_credit.is_(True), Shift.end > now, Shift.start < window_end)
+            )
         ]
         members = [MemberInfo(m.person_id, m.position, m.active) for m in team.memberships]
         pids = [m.person_id for m in members]
@@ -724,7 +736,7 @@ class DutyService:
             select(ShiftAssignment.person_id, Shift.start).join(Shift)
             .where(Shift.team_id == team.id, Shift.deleted.is_(False), Shift.cancelled.is_(False), Shift.end <= now,
                    Shift.start >= now - timedelta(days=HISTORY_DAYS), ShiftAssignment.person_id.is_not(None),
-                   Shift.manual.is_(False))
+                   or_(Shift.manual.is_(False), Shift.rotation_credit.is_(True)))
         )
         for pid, start in hist:
             last[pid] = max(last.get(pid, start), start)
@@ -741,6 +753,7 @@ class DutyService:
             duty_count=count,
             mode=mode,  # type: ignore[arg-type]
             freeze_until=now + timedelta(days=team.freeze_days if freeze_days is None else freeze_days),
+            fixed=fixed,
         )
         try:
             result = get_planner(team.absence_policy).plan(data)
@@ -1146,6 +1159,291 @@ class DutyService:
         self._replan(op, shift.team, "fix")
         return shift
 
+    # ------------------------------------------------------------ период: «в эти дни дежурят такие-то / никто»
+
+    def set_period(
+        self,
+        op: Op,
+        slug: str,
+        start,
+        end,
+        emails: list[str] | None = None,
+        force: bool = False,
+        replan: str = "rebalance",
+    ) -> dict:
+        """Заменить график на период [start, end).
+
+        * смены по графику внутри периода снимаются (дни без дежурства), на границах — обрезаются;
+          смена, накрывающая период целиком, делится: остаток после периода сохраняется у тех же людей;
+        * ручные дежурства в периоде убираются (на границах обрезаются);
+        * если указаны люди — они дежурят весь период, и это засчитывается им в очередь;
+        * затем оставшийся график перепланируется (replan: rebalance | fix | none), ротация продолжается
+          сразу после периода без наложений и дыр.
+        Даты: 'YYYY-MM-DD' (start — с начала дня; end — включительно) или ISO 8601 (handoff команды не применяется).
+        """
+        s = op.session
+        team = self.get_team(s, slug)
+        st = self._period_bound(team, start, end=False)
+        en = self._period_bound(team, end, end=True)
+        now = self.now()
+        if en <= st:
+            raise Invalid("конец периода должен быть позже начала")
+        if en <= now:
+            raise Invalid("этот период уже прошёл")
+        st = max(st, now)
+        people = self._check_people(s, team, emails, st, en, force) if emails else []
+
+        rows = list(s.scalars(
+            select(Shift).options(selectinload(Shift.assignments))
+            .where(Shift.team_id == team.id, Shift.deleted.is_(False), Shift.cancelled.is_(False),
+                   Shift.start < en, Shift.end > st)
+        ))
+        summary = {"cancelled": 0, "trimmed": 0, "split": 0, "removed_manual": 0}
+
+        def clone_rest(sh: Shift, credit: bool) -> None:
+            rest = Shift(team_id=team.id, start=en, end=sh.end, manual=True, rotation_credit=credit)
+            s.add(rest)
+            for a in sh.assignments:
+                if a.person_id is not None:
+                    rest.assignments.append(ShiftAssignment(seat=len(rest.assignments), person_id=a.person_id, pinned=True))
+
+        for sh in rows:
+            inside = st <= sh.start and sh.end <= en
+            if sh.manual:
+                if inside:
+                    if sh.external_id:
+                        sh.deleted = True
+                    else:
+                        s.delete(sh)
+                    summary["removed_manual"] += 1
+                elif sh.start < st and sh.end > en:
+                    clone_rest(sh, sh.rotation_credit)
+                    sh.end = st
+                    summary["split"] += 1
+                elif sh.start < st:
+                    sh.end = st
+                    summary["trimmed"] += 1
+                else:
+                    sh.start = en
+                    summary["trimmed"] += 1
+            else:
+                if sh.slot_start is None:
+                    sh.slot_start = sh.start
+                if inside:
+                    sh.cancelled = True
+                    for a in sh.assignments:
+                        if a.person_id is not None:
+                            self._log(op, sh, a.seat, a.person_id, None, "period")
+                    summary["cancelled"] += 1
+                elif sh.start < st and sh.end > en:
+                    clone_rest(sh, False)
+                    sh.end, sh.custom_period = st, True
+                    summary["split"] += 1
+                elif sh.start < st:
+                    sh.end, sh.custom_period = st, True
+                    summary["trimmed"] += 1
+                else:
+                    sh.start, sh.custom_period = en, True
+                    summary["trimmed"] += 1
+            sh.publish_dirty = True
+        s.flush()
+
+        period = None
+        if people:
+            period = Shift(team_id=team.id, start=st, end=en, manual=True, rotation_credit=True)
+            s.add(period)
+            s.flush()
+            for i, p in enumerate(people):
+                period.assignments.append(ShiftAssignment(seat=i, person_id=p.id, pinned=True))
+                self._log(op, period, i, None, p.id, "period")
+            period.publish_dirty = True
+            s.flush()
+
+        report = None
+        if replan in ("fix", "rebalance"):
+            report = self._replan(op, team, replan, notify=False, freeze_days=0)
+        elif replan != "none":
+            raise Invalid("replan: rebalance | fix | none")
+        who = mentions(people) if people else "никто не дежурит"
+        op.outbox.append((team.mattermost_webhook,
+                          f"🗓 **{team.name}**: {op.actor_name} задал период {fmt_range(st, en, team.timezone)} — {who}",
+                          team.mattermost_channel))
+        return {"period_shift_id": period.id if period else None, "start": st, "end": en,
+                "people": [p.name for p in people], **summary, "report": report}
+
+    def set_period_preview(self, op: Op, slug: str, start, end, emails=None, force=False, replan="rebalance",
+                           dry_run: bool = True) -> dict:
+        result, diff = self.preview(op, lambda: self.set_period(op, slug, start, end, emails, force, replan), dry_run)
+        result = {k: v for k, v in result.items() if k != "report"}
+        if dry_run:
+            result["period_shift_id"] = None
+        return {**result, "dry_run": dry_run, "changes": diff}
+
+    def _period_bound(self, team: Team, value, end: bool) -> datetime:
+        """Граница периода: дата → передача смены (handoff) команды в этот день (для end — на следующий день);
+        дата-время — как есть."""
+        if isinstance(value, datetime):
+            return value if value.tzinfo else value.replace(tzinfo=ZoneInfo(self.settings.timezone))
+        v = value.strip() if isinstance(value, str) else value
+        if isinstance(v, str) and len(v) > 10:
+            return self.parse_moment(v)
+        d = date.fromisoformat(v) if isinstance(v, str) else v
+        if end:
+            d = d + timedelta(days=1)
+        return datetime.combine(d, time.fromisoformat(team.handoff_time), ZoneInfo(team.timezone)).astimezone(UTC)
+
+    # ------------------------------------------------------------ предпросмотр и пакетные операции
+
+    def _snapshot(self, s: Session) -> dict[int, tuple]:
+        now = self.now()
+        rows = s.scalars(
+            select(Shift).options(selectinload(Shift.assignments).selectinload(ShiftAssignment.person),
+                                  selectinload(Shift.team))
+            .where(Shift.deleted.is_(False), Shift.end > now - timedelta(days=1))
+        )
+        return {
+            sh.id: (sh.team.slug, sh.team.name, sh.start, sh.end,
+                    tuple(a.person.name if a.person else None for a in sorted(sh.assignments, key=lambda a: a.seat)),
+                    sh.manual, sh.cancelled, sh.rotation_credit)
+            for sh in rows
+        }
+
+    @staticmethod
+    def _diff(before: dict[int, tuple], after: dict[int, tuple]) -> list[dict]:
+        def kind(v):
+            if v[6]:
+                return "снято"
+            if v[5] and v[7]:
+                return "период"
+            return "ручное" if v[5] else "график"
+
+        out = []
+        for sid in sorted(set(before) | set(after), key=lambda i: (after.get(i) or before.get(i))[2]):
+            b, a = before.get(sid), after.get(sid)
+            visible_b = b is not None and not b[6]
+            visible_a = a is not None and not a[6]
+            if b == a or (not visible_b and not visible_a):
+                continue
+            ref = a or b
+            out.append({
+                "shift_id": sid, "team": ref[0], "team_name": ref[1],
+                "action": "added" if not visible_b else "removed" if not visible_a else "changed",
+                "before": None if not visible_b else {"start": b[2], "end": b[3], "people": list(b[4]), "kind": kind(b)},
+                "after": None if not visible_a else {"start": a[2], "end": a[3], "people": list(a[4]), "kind": kind(a)},
+            })
+        return out
+
+    def preview(self, op: Op, fn: Callable[[], object], dry_run: bool) -> tuple[object, list[dict]]:
+        """Выполнить fn в транзакции и вернуть (результат, изменения графика). dry_run — откатить всё."""
+        s = op.session
+        before = self._snapshot(s)
+        notified = set(self._notified_conflicts)
+        result = fn()
+        s.flush()
+        after = self._snapshot(s)
+        diff = self._diff(before, after)
+        if dry_run:
+            s.rollback()
+            op.outbox.clear()
+            self._notified_conflicts = notified
+        return result, diff
+
+    BATCH_OPS = (
+        "set_period", "set_manual_shift", "set_shift_dates", "reset_shift_dates", "delete_shift", "restore_shift",
+        "assign_shift", "free_seat", "unpin_shift", "swap_shifts", "add_absence", "update_absence",
+        "remove_absence", "replan", "add_event", "update_event", "delete_event",
+    )
+
+    def run_batch(self, op: Op, operations: list[dict], dry_run: bool = True) -> dict:
+        """Несколько операций в одной транзакции: всё или ничего, общий предпросмотр, одно сообщение на команду."""
+        if not operations:
+            raise Invalid("список операций пуст")
+
+        def call(item: dict):
+            a = dict(item)
+            name = a.pop("op", None)
+            if name not in self.BATCH_OPS:
+                raise Invalid(f"неизвестная операция {name!r}; доступны: {', '.join(self.BATCH_OPS)}")
+            if name == "set_period":
+                r = self.set_period(op, a["team"], a["start"], a["end"], a.get("emails"), a.get("force", False),
+                                    a.get("replan", "rebalance"))
+                return f"период {a['start']}–{a['end']}: " + (", ".join(r["people"]) or "никто")
+            if name == "set_manual_shift":
+                sh = self.create_manual_shift(op, a["team"], a["start_date"], int(a.get("days", 1)), a["emails"],
+                                              a.get("force", False))
+                return f"ручное дежурство #{sh.id}"
+            if name == "set_shift_dates":
+                self.set_shift_period(op, int(a["shift_id"]), a["start"], a["end"], a.get("force", False))
+                return f"даты смены #{a['shift_id']} изменены"
+            if name == "reset_shift_dates":
+                self.reset_shift_period(op, int(a["shift_id"]))
+                return f"даты смены #{a['shift_id']} из графика"
+            if name == "delete_shift":
+                self.delete_shift(op, int(a["shift_id"]))
+                return f"смена #{a['shift_id']} удалена"
+            if name == "restore_shift":
+                self.restore_shift(op, int(a["shift_id"]))
+                return f"смена #{a['shift_id']} возвращена"
+            if name == "assign_shift":
+                self.assign(op, int(a["shift_id"]), a["email"], a.get("seat"), a.get("force", False))
+                return f"смена #{a['shift_id']}: назначен {a['email']}"
+            if name == "free_seat":
+                self.assign(op, int(a["shift_id"]), None, int(a.get("seat", 0)))
+                return f"смена #{a['shift_id']}: место освобождено"
+            if name == "unpin_shift":
+                self.unpin(op, int(a["shift_id"]), int(a.get("seat", 0)))
+                return f"смена #{a['shift_id']}: откреплено"
+            if name == "swap_shifts":
+                self.swap(op, int(a["shift_a"]), int(a.get("seat_a", 0)), int(a["shift_b"]), int(a.get("seat_b", 0)),
+                          a.get("force", False))
+                return f"обмен #{a['shift_a']} ↔ #{a['shift_b']}"
+            if name == "add_absence":
+                self.add_absence(op, a["email"], a["start"], a["end"], a.get("kind", "vacation"), a.get("note", ""))
+                return f"отсутствие {a['email']} {a['start']}–{a['end']}"
+            if name == "update_absence":
+                self.update_absence(op, int(a["absence_id"]), a.get("start"), a.get("end"), a.get("kind"), a.get("note"))
+                return f"отсутствие #{a['absence_id']} изменено"
+            if name == "remove_absence":
+                self.delete_absence(op, int(a["absence_id"]))
+                return f"отсутствие #{a['absence_id']} удалено"
+            if name == "replan":
+                self.plan_team(op, a["team"], a.get("mode", "rebalance"), False, a.get("freeze_days", 0))
+                return f"перепланирование {a['team']}"
+            if name == "add_event":
+                ev = self.create_event(op, a)
+                return f"событие #{ev.id}"
+            if name == "update_event":
+                self.update_event(op, int(a.pop("event_id")), a)
+                return "событие изменено"
+            if name == "delete_event":
+                self.delete_event(op, int(a["event_id"]))
+                return "событие удалено"
+            raise Invalid(name)
+
+        def run_all():
+            done = []
+            for i, item in enumerate(operations, 1):
+                try:
+                    done.append(call(item))
+                except ServiceError as exc:
+                    raise type(exc)(f"операция {i} ({item.get('op')}): {exc.message}") from exc
+                except KeyError as exc:
+                    raise Invalid(f"операция {i} ({item.get('op')}): не хватает параметра {exc}") from exc
+            return done
+
+        results, diff = self.preview(op, run_all, dry_run)
+        if not dry_run:
+            self._merge_outbox(op)
+        return {"dry_run": dry_run, "results": results, "changes": diff}
+
+    @staticmethod
+    def _merge_outbox(op: Op) -> None:
+        """Склеить сообщения пакета: одно сообщение на канал."""
+        merged: dict[tuple, list[str]] = {}
+        for webhook, text, channel in op.outbox:
+            merged.setdefault((webhook, channel), []).append(text)
+        op.outbox[:] = [(w, "\n".join(texts), c) for (w, c), texts in merged.items()]
+
     # ------------------------------------------------------------ события (не дежурства)
 
     def list_events(self, s: Session, start: datetime, end: datetime, team_slugs: list[str] | None = None):
@@ -1363,7 +1661,7 @@ class DutyService:
             now = self.now()
             for team in self.list_teams(s):
                 current = self.oncall(s, team.slug, now)
-                grid = [x for x in current if not x.manual]
+                grid = [x for x in current if not x.manual or x.rotation_credit]
                 if not grid:
                     continue
                 sh = grid[0]
@@ -1371,7 +1669,8 @@ class DutyService:
                     continue
                 team.last_announced_shift_id = sh.id
                 people = [a.person for a in sh.assignments]
-                extra = [a.person for x in current if x.manual for a in x.assignments if a.person]
+                extra = [a.person for x in current if x.manual and not x.rotation_credit
+                         for a in x.assignments if a.person]
                 nxt = s.scalar(
                     select(Shift).options(selectinload(Shift.assignments).selectinload(ShiftAssignment.person))
                     .where(Shift.team_id == team.id, Shift.deleted.is_(False), Shift.manual.is_(False),

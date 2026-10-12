@@ -180,6 +180,57 @@ def build_mcp(svc: DutyService, resolve_user: Callable[[], User | None] = _heade
         return call(run)
 
     @mcp.tool
+    def set_period(
+        team: str,
+        start: str,
+        end: str,
+        emails: list[str] | None = None,
+        replan: Literal["rebalance", "fix", "none"] = "rebalance",
+        force: bool = False,
+        dry_run: bool = True,
+    ) -> dict:
+        """Заменить график на период одним действием: «с start по end дежурят emails» или, если emails пуст,
+        «в эти дни никто не дежурит». Смены по графику внутри периода снимаются, на границах обрезаются;
+        дежурство на период засчитывается в очередь; затем график перепланируется (replan), ротация
+        продолжается сразу после периода. Даты: 'YYYY-MM-DD' (start — с передачи смены в этот день, end —
+        включительно) или ISO 8601. По умолчанию dry_run=true — вернёт список изменений без сохранения."""
+        u = user()
+
+        def run():
+            with svc.write(u) as op:
+                return _dump(S.PeriodResult(**svc.set_period_preview(op, team, start, end, emails or [], force,
+                                                                     replan, dry_run)))
+
+        return call(run)
+
+    @mcp.tool
+    def plan_batch(operations: list[dict], dry_run: bool = True) -> dict:
+        """Выполнить несколько операций в одной транзакции (всё или ничего) с общим предпросмотром.
+        По умолчанию dry_run=true: показать итоговые изменения графика, ничего не сохраняя; затем повторить
+        с dry_run=false. Каждая операция — {"op": имя, ...параметры}:
+          set_period {team, start, end, emails?, replan?, force?}
+          set_manual_shift {team, start_date, days, emails, force?}
+          set_shift_dates {shift_id, start, end, force?} · reset_shift_dates {shift_id}
+          delete_shift {shift_id} · restore_shift {shift_id}
+          assign_shift {shift_id, email, seat?, force?} · free_seat {shift_id, seat} · unpin_shift {shift_id, seat?}
+          swap_shifts {shift_a, shift_b, seat_a?, seat_b?, force?}
+          add_absence {email, start, end, kind?, note?} · update_absence {absence_id, start?, end?, kind?, note?}
+          remove_absence {absence_id}
+          replan {team, mode?=rebalance, freeze_days?=0}
+          add_event {title, start, end, team?, emails?, color?, description?} · update_event {event_id, ...}
+          delete_event {event_id}
+        Пример «с 10 по 20 никто, потом 3 дня enot, дальше автоматически»:
+          [{"op":"set_period","team":"sec","start":"2026-10-10","end":"2026-10-20","replan":"none"},
+           {"op":"set_period","team":"sec","start":"2026-10-21","end":"2026-10-23","emails":["enot@x.ru"]}]"""
+        u = user()
+
+        def run():
+            with svc.write(u) as op:
+                return _dump(S.BatchResult(**svc.run_batch(op, operations, dry_run)))
+
+        return call(run)
+
+    @mcp.tool
     def set_shift_dates(shift_id: int, start: str, end: str, force: bool = False) -> dict:
         """Изменить даты дежурства (ISO 8601 или YYYY-MM-DD). У смены по графику меняются только её даты,
         ротация дальше не сдвигается."""

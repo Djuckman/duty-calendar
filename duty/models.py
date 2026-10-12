@@ -32,7 +32,7 @@ class Team(Base):
     weekdays: Mapped[str] = mapped_column(String(7), default="1234567")  # ISO-дни, в которые смена может начинаться
     skip_holidays: Mapped[bool] = mapped_column(Boolean, default=False)  # не начинать смены в праздники/выходные по произв. календарю
     horizon_days: Mapped[int] = mapped_column(Integer, default=56)  # на сколько дней вперёд планировать
-    freeze_days: Mapped[int] = mapped_column(Integer, default=7)  # rebalance не трогает ближайшие N дней
+    freeze_days: Mapped[int] = mapped_column(Integer, default=0)  # rebalance не трогает ближайшие N дней
     absence_policy: Mapped[str] = mapped_column(String(20), default="whole")  # whole | split
     notify_days: Mapped[int] = mapped_column(Integer, default=14)  # о перестановках дальше N дней не сообщаем
 
@@ -105,6 +105,7 @@ class Shift(Base):
     start: Mapped[datetime] = mapped_column(UTCDateTime, index=True)
     end: Mapped[datetime] = mapped_column(UTCDateTime)
     deleted: Mapped[bool] = mapped_column(Boolean, default=False)  # удалена, ждёт снятия из внешнего календаря
+    manual: Mapped[bool] = mapped_column(Boolean, default=False)  # период задан вручную, а не сеткой ротации
 
     # Публикация во внешний календарь (Exchange и т.п.): одно событие на смену, все дежурные — участники
     external_id: Mapped[str | None] = mapped_column(String(512), nullable=True)

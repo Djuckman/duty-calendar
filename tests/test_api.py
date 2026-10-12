@@ -202,3 +202,73 @@ def test_business_days_two_day_rotation_after_adding_people_one_by_one(admin, se
     seq = [p for _, p, _ in groups]
     assert all(a != b for a, b in zip(seq, seq[1:])), seq
     assert seq[1:5] and len(set(seq[1:5])) == 4, seq
+
+
+def _rows(admin, team, start="2026-10-01T00:00:00Z", end="2026-11-20T00:00:00Z"):
+    msk = ZoneInfo("Europe/Moscow")
+    out = []
+    for sh in admin.get("/api/v1/shifts", params={"team": team, "start": start, "end": end}).json():
+        out.append((datetime.fromisoformat(sh["start"]).astimezone(msk).strftime("%d.%m"),
+                    datetime.fromisoformat(sh["end"]).astimezone(msk).strftime("%d.%m"),
+                    [s["person"]["name"] if s["person"] else None for s in sh["seats"]], sh["manual"], sh["id"]))
+    return out
+
+
+def test_manual_shift_one_day_inside_week(team, admin):
+    # неделя 12.10–19.10 у Бори; вручную ставим Аню на 14.10 (1 день)
+    r = admin.post("/api/v1/teams/sec/shifts", json={"start_date": "2026-10-14", "days": 1, "emails": ["a@x.ru"]})
+    assert r.status_code == 201, r.text
+    rows = [x[:4] for x in _rows(admin, "sec", end="2026-10-18T00:00:00Z")]
+    assert rows[1:] == [("12.10", "14.10", ["Боря"], False), ("14.10", "15.10", ["Аня"], True),
+                        ("15.10", "19.10", ["Боря"], False)]
+    # пересекающуюся ручную смену создать нельзя
+    r = admin.post("/api/v1/teams/sec/shifts", json={"start_date": "2026-10-13", "days": 2, "emails": ["b@x.ru"]})
+    assert r.status_code == 409
+    # удаление ручной смены возвращает период в сетку
+    manual_id = [x for x in _rows(admin, "sec") if x[3]][0][4]
+    assert admin.delete(f"/api/v1/shifts/{manual_id}").status_code == 200
+    rows = [x[:4] for x in _rows(admin, "sec", end="2026-10-18T00:00:00Z")]
+    assert rows[1:] == [("12.10", "19.10", ["Боря"], False)]
+    # обычную смену удалить нельзя
+    grid_id = _rows(admin, "sec")[0][4]
+    assert admin.delete(f"/api/v1/shifts/{grid_id}").status_code == 422
+
+
+def test_manual_shift_several_people_and_absence_check(team, admin):
+    admin.post("/api/v1/absences", json={"email": "c@x.ru", "start": "2026-10-20", "end": "2026-10-21"})
+    body = {"start_date": "2026-10-20", "days": 2, "emails": ["b@x.ru", "c@x.ru"]}
+    r = admin.post("/api/v1/teams/sec/shifts", json=body)
+    assert r.status_code == 409 and "отсутствует" in r.json()["detail"]
+    r = admin.post("/api/v1/teams/sec/shifts", json={**body, "force": True})
+    assert r.status_code == 201
+    assert [s["person"]["name"] for s in r.json()["shift"]["seats"]] == ["Боря", "Вика"]
+
+
+def test_update_absence(team, admin):
+    r = admin.post("/api/v1/absences", json={"email": "b@x.ru", "start": "2026-11-20", "end": "2026-11-21"})
+    aid = r.json()["absence"]["id"]
+    # переносим на неделю Бори (13.10) — сначала предпросмотр
+    r = admin.patch(f"/api/v1/absences/{aid}", params={"dry_run": True}, json={"start": "2026-10-13", "end": "2026-10-14"})
+    assert r.status_code == 200
+    assert r.json()["plans"][0]["changes"][0]["reason"] == "absent"
+    assert admin.get("/api/v1/absences").json()[0]["start"].startswith("2026-11-19")  # не изменилось
+    r = admin.patch(f"/api/v1/absences/{aid}", json={"start": "2026-10-13", "end": "2026-10-14", "note": "перенос"})
+    assert r.json()["absence"]["note"] == "перенос"
+    assert names(get_shifts(admin))[1] == ["Вика"]
+
+
+def test_auto_migration_adds_column(tmp_path):
+    import sqlite3
+
+    from duty.db import init_db
+
+    path = tmp_path / "old.db"
+    con = sqlite3.connect(path)
+    con.execute("CREATE TABLE shifts (id INTEGER PRIMARY KEY, team_id INTEGER, start DATETIME, \"end\" DATETIME, "
+                "deleted BOOLEAN, external_id VARCHAR(512), publish_dirty BOOLEAN, updated_at DATETIME)")
+    con.execute("INSERT INTO shifts (id, team_id, deleted, publish_dirty) VALUES (1, 1, 0, 0)")
+    con.commit()
+    con.close()
+    init_db(f"sqlite:///{path}")
+    con = sqlite3.connect(path)
+    assert con.execute("SELECT manual FROM shifts WHERE id = 1").fetchone() == (0,)

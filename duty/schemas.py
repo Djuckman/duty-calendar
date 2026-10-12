@@ -120,6 +120,7 @@ class ShiftOut(BaseModel):
     start: datetime
     end: datetime
     people_per_shift: int
+    manual: bool = False
     seats: list[SeatOut]
 
 
@@ -131,6 +132,7 @@ def shift_out(sh: Shift) -> ShiftOut:
         start=sh.start,
         end=sh.end,
         people_per_shift=sh.team.people_per_shift,
+        manual=sh.manual,
         seats=[
             SeatOut(seat=a.seat, person=PersonOut.model_validate(a.person) if a.person else None, pinned=a.pinned)
             for a in sorted(sh.assignments, key=lambda a: a.seat)
@@ -142,6 +144,18 @@ class AssignIn(BaseModel):
     email: str | None = Field(None, description="Кого назначить; null — освободить место")
     seat: int | None = Field(None, description="Номер места (с 0); null при назначении — добавить ещё одно место")
     force: bool = Field(False, description="Назначить, даже если человек отсутствует")
+
+
+class ManualShiftIn(BaseModel):
+    start_date: date = Field(description="Первый день дежурства")
+    days: int = Field(1, ge=1, le=366, description="Сколько календарных дней")
+    emails: list[str] = Field(description="Кто дежурит (один или несколько)")
+    force: bool = Field(False, description="Назначить, даже если кто-то отсутствует")
+
+
+class ManualShiftResult(BaseModel):
+    shift: "ShiftOut"
+    plan: "PlanReportOut"
 
 
 class UnpinIn(BaseModel):
@@ -231,11 +245,21 @@ class AbsenceIn(BaseModel):
     note: str = ""
 
 
+class AbsencePatch(BaseModel):
+    start: str | None = None
+    end: str | None = None
+    kind: Literal["vacation", "sick", "dayoff", "other"] | None = None
+    note: str | None = None
+
+
 class AbsenceOut(BaseModel):
     id: int
     person: PersonOut
     start: datetime
     end: datetime
+    all_day: bool = False  # целые дни по поясу сервиса
+    start_day: date | None = None  # первый день (если all_day)
+    end_day: date | None = None  # последний день включительно (если all_day)
     kind: str
     source: str
     note: str
@@ -243,8 +267,18 @@ class AbsenceOut(BaseModel):
 
 
 def absence_out(a: Absence) -> AbsenceOut:
-    return AbsenceOut(id=a.id, person=PersonOut.model_validate(a.person), start=a.start, end=a.end, kind=a.kind,
-                      source=a.source, note=a.note, created_by=a.created_by)
+    from datetime import timedelta
+    from zoneinfo import ZoneInfo
+
+    from .config import get_settings
+
+    tz = ZoneInfo(get_settings().timezone)
+    ls, le = a.start.astimezone(tz), a.end.astimezone(tz)
+    all_day = ls.time() == le.time() == datetime.min.time()
+    return AbsenceOut(id=a.id, person=PersonOut.model_validate(a.person), start=a.start, end=a.end,
+                      all_day=all_day, start_day=ls.date() if all_day else None,
+                      end_day=(le.date() - timedelta(days=1)) if all_day else None,
+                      kind=a.kind, source=a.source, note=a.note, created_by=a.created_by)
 
 
 class AbsenceResult(BaseModel):
@@ -331,5 +365,7 @@ def user_out(u: User) -> UserOut:
 def holiday_out(h: Holiday) -> HolidayOut:
     return HolidayOut.model_validate(h)
 
+
+ManualShiftResult.model_rebuild()
 
 __all__ = [n for n in dir() if not n.startswith("_")] + ["ChangeView", "ConflictView"]

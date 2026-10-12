@@ -85,9 +85,12 @@ label.inline input { width: auto; }
 .sw { display: inline-block; width: 14px; height: 10px; border-radius: 3px; margin-right: 6px; vertical-align: middle; }
 .sw-shift { background: var(--accent); }
 .sw-pinned { background: var(--accent); outline: 2px solid #f2b705; }
-.sw-problem { background: var(--danger); }
+.sw-problem { background: transparent; outline: 2px solid var(--danger); outline-offset: -2px; }
 .sw-absence { background: transparent; border: 1px dashed var(--absence); }
 .sw-holiday { background: var(--holiday); }
+.sw-manual { background: var(--accent) repeating-linear-gradient(135deg, rgba(255,255,255,.35) 0 3px, transparent 3px 6px); }
+.people-legend .person { display: flex; align-items: center; gap: 4px; margin-bottom: 4px; }
+.fc .fc-highlight { background: var(--accent-weak); }
 .sw-weekend { background: var(--weekend); border: 1px solid var(--line); }
 
 .user-menu { position: relative; }
@@ -115,7 +118,8 @@ label.inline input { width: auto; }
 .fc .fc-daygrid-day.fc-day-today, .fc .fc-timegrid-col.fc-day-today { background: var(--fc-today-bg-color); }
 .fc-event { cursor: pointer; }
 .fc-event.ev-pinned { box-shadow: inset 3px 0 0 #f2b705; }
-.fc-event.ev-problem { background: var(--danger) !important; border-color: var(--danger) !important; }
+.fc-event.ev-manual { background-image: repeating-linear-gradient(135deg, rgba(255,255,255,.18) 0 6px, transparent 6px 12px); }
+.fc-event.ev-problem { outline: 2px solid var(--danger); outline-offset: -2px; }
 .fc-event.ev-absence { background: transparent !important; border: 1px dashed var(--absence) !important; }
 .fc-event.ev-absence .fc-event-title, .fc-event.ev-absence .fc-event-main { color: var(--absence) !important; }
 .fc .fc-bg-event.ev-holiday { background: var(--holiday); opacity: 1; }

@@ -59,8 +59,37 @@ def init_db(url: str) -> Engine:
     from . import models  # noqa: F401  регистрируем модели
 
     Base.metadata.create_all(_engine)
+    _add_missing_columns(_engine)
     _SessionLocal = sessionmaker(_engine, expire_on_commit=False)
     return _engine
+
+
+def _add_missing_columns(engine: Engine) -> None:
+    """Мини-миграция: добавить в существующие таблицы колонки, появившиеся в моделях.
+    (Полноценные миграции — Alembic — когда схема начнёт меняться сложнее.)"""
+    from sqlalchemy import inspect, text
+
+    insp = inspect(engine)
+    with engine.begin() as conn:
+        for table in Base.metadata.sorted_tables:
+            if not insp.has_table(table.name):
+                continue
+            have = {c["name"] for c in insp.get_columns(table.name)}
+            for col in table.columns:
+                if col.name in have:
+                    continue
+                ddl_type = col.type.compile(dialect=engine.dialect)
+                default = col.default.arg if col.default is not None and not callable(col.default.arg) else None
+                if isinstance(default, bool):
+                    default_sql = " DEFAULT " + ("TRUE" if default else "FALSE") if engine.dialect.name != "sqlite" \
+                        else f" DEFAULT {int(default)}"
+                elif isinstance(default, (int, float)):
+                    default_sql = f" DEFAULT {default}"
+                elif isinstance(default, str):
+                    default_sql = " DEFAULT '" + default.replace("'", "''") + "'"
+                else:
+                    default_sql = ""
+                conn.execute(text(f'ALTER TABLE {table.name} ADD COLUMN {col.name} {ddl_type}{default_sql}'))
 
 
 def get_engine() -> Engine:

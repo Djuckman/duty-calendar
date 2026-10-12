@@ -276,6 +276,21 @@ def assign(shift_id: int, data: S.AssignIn, user: CurrentUser, svc: Svc):
         return S.shift_out(svc.assign(op, shift_id, data.email, data.seat, data.force))
 
 
+@router.post("/teams/{slug}/shifts", response_model=S.ManualShiftResult, status_code=201, tags=["shifts"])
+def create_manual_shift(slug: str, data: S.ManualShiftIn, user: CurrentUser, svc: Svc):
+    """Ручное дежурство на N календарных дней (вырезается из сетки ротации)."""
+    with svc.write(user) as op:
+        shift, report = svc.create_manual_shift(op, slug, data.start_date, data.days, data.emails, data.force)
+        return S.ManualShiftResult(shift=S.shift_out(shift), plan=S.report_out(report))
+
+
+@router.delete("/shifts/{shift_id}", response_model=S.PlanReportOut, tags=["shifts"])
+def delete_shift(shift_id: int, user: CurrentUser, svc: Svc):
+    """Удалить ручную смену — период вернётся в сетку ротации."""
+    with svc.write(user) as op:
+        return S.report_out(svc.delete_shift(op, shift_id))
+
+
 @router.post("/shifts/{shift_id}/unpin", response_model=S.ShiftOut, tags=["shifts"])
 def unpin(shift_id: int, data: S.UnpinIn, user: CurrentUser, svc: Svc):
     with svc.write(user) as op:
@@ -305,6 +320,16 @@ def add_absence(data: S.AbsenceIn, user: CurrentUser, svc: Svc, dry_run: bool = 
         absence, reports = svc.add_absence(op, data.email, data.start, data.end, data.kind, data.note, dry_run)
         return S.AbsenceResult(absence=S.absence_out(absence) if absence else None,
                                plans=[S.report_out(r) for r in reports])
+
+
+@router.patch("/absences/{absence_id}", response_model=S.AbsenceResult, tags=["absences"])
+def update_absence(absence_id: int, data: S.AbsencePatch, user: CurrentUser, svc: Svc, dry_run: bool = False):
+    with svc.write(user) as op:
+        absence, reports = svc.update_absence(op, absence_id, data.start, data.end, data.kind, data.note, dry_run)
+        out = S.AbsenceResult(absence=S.absence_out(absence), plans=[S.report_out(r) for r in reports])
+        if dry_run:
+            op.session.rollback()
+        return out
 
 
 @router.delete("/absences/{absence_id}", response_model=S.AbsenceResult, tags=["absences"])

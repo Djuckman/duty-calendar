@@ -146,6 +146,52 @@ def build_mcp(svc: DutyService, resolve_user: Callable[[], User | None] = _heade
         return call(run)
 
     @mcp.tool
+    def update_absence(
+        absence_id: int,
+        start: str | None = None,
+        end: str | None = None,
+        kind: Literal["vacation", "sick", "dayoff", "other"] | None = None,
+        note: str | None = None,
+        dry_run: bool = False,
+    ) -> dict:
+        """Изменить отсутствие (даты, тип, комментарий) и перепланировать. dry_run=true — только показать."""
+        u = user()
+
+        def run():
+            with svc.write(u) as op:
+                absence, reports = svc.update_absence(op, absence_id, start, end, kind, note, dry_run)
+                out = _dump(S.AbsenceResult(absence=S.absence_out(absence), plans=[S.report_out(r) for r in reports]))
+                if dry_run:
+                    op.session.rollback()
+                return out
+
+        return call(run)
+
+    @mcp.tool
+    def set_manual_shift(team: str, start_date: str, days: int, emails: list[str], force: bool = False) -> dict:
+        """Назначить дежурство вручную на N календарных дней начиная с start_date (YYYY-MM-DD) одному или
+        нескольким людям. Период вырезается из сетки ротации, соседние смены укорачиваются."""
+        u = user()
+
+        def run():
+            with svc.write(u) as op:
+                shift, report = svc.create_manual_shift(op, team, start_date, days, emails, force)
+                return _dump(S.ManualShiftResult(shift=S.shift_out(shift), plan=S.report_out(report)))
+
+        return call(run)
+
+    @mcp.tool
+    def delete_manual_shift(shift_id: int) -> dict:
+        """Удалить ручную смену — её период вернётся в сетку ротации."""
+        u = user()
+
+        def run():
+            with svc.write(u) as op:
+                return _dump(S.report_out(svc.delete_shift(op, shift_id)))
+
+        return call(run)
+
+    @mcp.tool
     def assign_shift(shift_id: int, email: str, seat: int | None = None, force: bool = False) -> dict:
         """Назначить человека на место в смене (место закрепляется). seat=None — добавить ещё одно место.
         force=true — назначить, даже если человек в отпуске."""

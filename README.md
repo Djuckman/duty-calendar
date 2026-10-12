@@ -22,6 +22,11 @@
   (Outlook/Exchange, HR-система, 1С).
 - **Ручные правки:** назначить, освободить место, обменяться сменами. Ручное назначение закрепляет место (📌),
   и планировщик его не трогает.
+- **Ручное дежурство на любой период.** Клик по дню или протяжка по нескольким дням открывает назначение одного
+  или нескольких людей на N календарных дней. Период вырезается из графика ротации: соседние смены
+  укорачиваются, люди в них не меняются. Если ручное дежурство удалить, эти дни вернутся в график.
+- **Отсутствия можно редактировать** (даты, тип, комментарий) с предпросмотром последствий.
+- **Каждый человек в календаре своим цветом**, несколько дежурных в один день — отдельные полосы.
 - **Предпросмотр.** Любое изменение (отсутствие, перепланирование) можно сначала посмотреть в режиме `dry_run`.
 - **Праздники РФ** видны в календаре и могут исключаться из сетки смен.
 - **Mattermost:** начало смены, перестановки, конфликты, ручные изменения.
@@ -125,8 +130,8 @@ Endpoint: `http://<host>:8000/mcp/` (Streamable HTTP), авторизация �
 
 Инструменты:
 - **чтение:** `list_teams`, `who_is_on_call`, `get_schedule`, `list_absences`, `list_holidays`;
-- **изменения:** `add_absence`, `remove_absence`, `assign_shift`, `free_seat`, `unpin_shift`, `swap_shifts`,
-  `replan` (по умолчанию `dry_run=true`);
+- **изменения:** `add_absence`, `update_absence`, `remove_absence`, `set_manual_shift`, `delete_manual_shift`,
+  `assign_shift`, `free_seat`, `unpin_shift`, `swap_shifts`, `replan` (по умолчанию `dry_run=true`);
 - **для админа:** `add_member`, `set_member_active`, `remove_member`.
 
 Примеры запросов: «Боря в отпуске 3–14 ноября, покажи, что поменяется», «кто дежурит в SEC на праздниках»,
@@ -147,10 +152,13 @@ Endpoint: `http://<host>:8000/mcp/` (Streamable HTTP), авторизация �
 | GET | `/api/v1/teams/{slug}/calendar.ics?token=` | ICS-подписка |
 | GET | `/api/v1/shifts?team=&person=&start=&end=` | смены |
 | POST | `/api/v1/shifts/{id}/assign` | `{email, seat, force}` — назначить (закрепляет); `email=null` — освободить |
+| POST | `/api/v1/teams/{slug}/shifts` | `{start_date, days, emails, force}` — ручное дежурство на N дней |
+| DELETE | `/api/v1/shifts/{id}` | удалить ручное дежурство (дни вернутся в график) |
 | POST | `/api/v1/shifts/{id}/unpin` | снять закрепление |
 | POST | `/api/v1/shifts/swap` | обмен местами между сменами |
 | GET | `/api/v1/shifts/{id}/log` | история изменений смены |
 | GET/POST | `/api/v1/absences?dry_run=` | отсутствия: даты `YYYY-MM-DD` включительно или ISO-время |
+| PATCH | `/api/v1/absences/{id}?dry_run=` | изменить отсутствие |
 | DELETE | `/api/v1/absences/{id}?dry_run=` | удалить отсутствие |
 | GET/PUT | `/api/v1/holidays` | производственный календарь, ручные дни |
 | POST | `/api/v1/holidays/sync` | загрузить праздники от провайдера |

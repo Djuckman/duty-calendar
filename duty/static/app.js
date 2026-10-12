@@ -3,6 +3,9 @@
 
 const API = "/api/v1";
 const COLORS = ["#0f6cbd", "#0e7a5f", "#8a3ffc", "#b35c00", "#007c89", "#a2287a", "#4f6bed", "#5c7a00"];
+// цвета людей: контрастные с белым текстом, соседние по списку максимально различаются
+const PERSON_COLORS = ["#1f6feb", "#d1495b", "#2a9d57", "#8957e5", "#d97706", "#0e8a9a", "#c2185b", "#5c6bc0",
+                       "#6d8b00", "#b35c00", "#00796b", "#7b4fd6"];
 const KINDS = { vacation: "отпуск", sick: "больничный", dayoff: "отгул", other: "другое" };
 const REASONS = {
   new: "новая смена", absent: "отсутствие", inactive: "выключен из ротации", unfilled: "место было свободно",
@@ -121,6 +124,11 @@ function teamColor(slug) {
   return COLORS[(i < 0 ? 0 : i) % COLORS.length];
 }
 const teamBySlug = (slug) => state.teams.find((t) => t.slug === slug);
+function personColor(id) {
+  const ids = state.people.map((p) => p.id).sort((a, b) => a - b);
+  const i = ids.indexOf(id);
+  return PERSON_COLORS[(i < 0 ? id : i) % PERSON_COLORS.length];
+}
 const personById = (id) => state.people.find((p) => p.id === id);
 
 async function loadReference() {
@@ -129,6 +137,16 @@ async function loadReference() {
   state.selected = new Set((saved || state.teams.map((t) => t.slug)).filter((s) => teamBySlug(s)));
   if (!state.selected.size) state.teams.forEach((t) => state.selected.add(t.slug));
   renderTeamFilter();
+  renderPeopleLegend();
+}
+
+function renderPeopleLegend() {
+  const emails = new Set();
+  state.teams.filter((t) => state.selected.has(t.slug)).forEach((t) => t.members.forEach((m) => emails.add(m.email)));
+  const people = state.people.filter((p) => emails.has(p.email)).sort((a, b) => a.name.localeCompare(b.name, "ru"));
+  $("#people-legend").innerHTML = people.map((p) =>
+    `<div class="person"><span class="team-dot" style="background:${personColor(p.id)}"></span>${esc(p.name)}</div>`).join("")
+    || `<p class="muted">—</p>`;
 }
 
 function renderTeamFilter() {
@@ -139,6 +157,7 @@ function renderTeamFilter() {
   $("#team-filter").querySelectorAll("input").forEach((cb) => cb.onchange = () => {
     cb.checked ? state.selected.add(cb.value) : state.selected.delete(cb.value);
     store("duty.teams", [...state.selected]);
+    renderPeopleLegend();
     refresh();
   });
 }
@@ -163,7 +182,7 @@ function absencesOf(personId, start, end) {
 function shiftProblems(sh) {
   const problems = [];
   const filled = sh.seats.filter((s) => s.person);
-  if (filled.length < sh.people_per_shift) problems.push("не все места заняты");
+  if (filled.length < (sh.manual ? sh.seats.length : sh.people_per_shift)) problems.push("не все места заняты");
   for (const s of filled) if (absencesOf(s.person.id, sh.start, sh.end).length) problems.push(`${s.person.name} отсутствует`);
   return problems;
 }
@@ -171,24 +190,30 @@ function shiftProblems(sh) {
 function toEvents(data) {
   const events = [];
   for (const sh of data.shifts) {
-    const names = sh.seats.map((s) => s.person?.name || "—").join(", ");
-    const cls = [];
-    if (sh.seats.some((s) => s.pinned)) cls.push("ev-pinned");
-    if (shiftProblems(sh).length) cls.push("ev-problem");
-    if (state.swap && state.swap.shift.id === sh.id) cls.push("ev-selecting");
-    const color = teamColor(sh.team);
-    events.push({
-      id: "s" + sh.id, title: (state.selected.size > 1 ? sh.team_name + ": " : "") + names + (cls.includes("ev-pinned") ? " 📌" : ""),
-      start: sh.start, end: sh.end, backgroundColor: color, borderColor: color, classNames: cls,
-      display: "block", extendedProps: { type: "shift", shift: sh },
-    });
+    // каждый дежурный — отдельная полоса своего цвета
+    const seatCount = (sh.manual ? sh.seats.length : Math.max(sh.people_per_shift, ...sh.seats.map((x) => x.seat + 1), 0));
+    for (let i = 0; i < seatCount; i++) {
+      const seat = sh.seats.find((x) => x.seat === i) || { seat: i, person: null, pinned: false };
+      const p = seat.person;
+      const cls = [];
+      if (seat.pinned) cls.push("ev-pinned");
+      if (sh.manual) cls.push("ev-manual");
+      if (!p || absencesOf(p.id, sh.start, sh.end).length) cls.push("ev-problem");
+      if (state.swap && state.swap.shift.id === sh.id && state.swap.seat === i) cls.push("ev-selecting");
+      const color = p ? personColor(p.id) : "#c4314b";
+      const prefix = state.selected.size > 1 ? sh.team_name + ": " : "";
+      events.push({
+        id: `s${sh.id}-${i}`, title: prefix + (p ? p.name : "свободно") + (seat.pinned ? " 📌" : ""),
+        start: sh.start, end: sh.end, backgroundColor: color, borderColor: color, classNames: cls,
+        display: "block", extendedProps: { type: "shift", shift: sh, seat: i },
+      });
+    }
   }
   for (const a of data.absences) {
-    const s = new Date(a.start), e = new Date(a.end);
-    const wholeDays = s.getHours() === 0 && s.getMinutes() === 0 && e.getHours() === 0 && e.getMinutes() === 0;
+    const endExcl = a.all_day ? (() => { const d = new Date(a.end_day + "T00:00:00"); d.setDate(d.getDate() + 1); return isoDate(d); })() : a.end;
     events.push({
       id: "a" + a.id, title: `🏖 ${a.person.name} · ${KINDS[a.kind] || a.kind}`,
-      start: wholeDays ? isoDate(s) : a.start, end: wholeDays ? isoDate(e) : a.end, allDay: wholeDays,
+      start: a.all_day ? a.start_day : a.start, end: endExcl, allDay: a.all_day,
       classNames: ["ev-absence"], display: "block", extendedProps: { type: "absence", absence: a },
     });
   }
@@ -212,7 +237,15 @@ function initCalendar() {
     displayEventEnd: false, dayMaxEvents: 6, nowIndicator: true,
     // смена «пн 11:00 – ср 11:00» занимает пн и вт, а не залезает на среду (утро дня передачи)
     nextDayThreshold: "23:59:59",
-    eventOrder: (a, b) => (a.extendedProps.type === "shift" ? 0 : 1) - (b.extendedProps.type === "shift" ? 0 : 1),
+    eventOrder: (a, b) => ((a.extendedProps.type === "shift" ? 0 : 1) - (b.extendedProps.type === "shift" ? 0 : 1))
+      || ((a.extendedProps.seat ?? 0) - (b.extendedProps.seat ?? 0)),
+    // клик или протяжка по дням — ручное дежурство на выбранные дни
+    selectable: true, selectMirror: true, unselectAuto: true,
+    select: (info) => {
+      state.calendar.unselect();
+      const days = info.allDay ? Math.max(1, Math.round((info.end - info.start) / 86400000)) : 1;
+      openManualShift(isoDate(info.start), days);
+    },
     datesSet: (info) => store("duty.view", info.view.type),
     events: async (info, success, failure) => {
       try {
@@ -225,7 +258,7 @@ function initCalendar() {
     },
     eventClick: (info) => {
       const p = info.event.extendedProps;
-      if (p.type === "shift") (state.swap ? finishSwap(p.shift) : openShift(p.shift.id));
+      if (p.type === "shift") (state.swap ? finishSwap(p.shift, p.seat) : openShift(p.shift.id));
       else if (p.type === "absence") openAbsence(p.absence);
     },
   });
@@ -269,7 +302,7 @@ async function openShift(shiftId) {
   const sh = await guard(() => api("GET", `/shifts/${shiftId}`));
   const team = teamBySlug(sh.team) || (await api("GET", `/teams/${sh.team}`));
   const past = new Date(sh.end) <= new Date();
-  const seatCount = Math.max(sh.people_per_shift, ...sh.seats.map((s) => s.seat + 1), 0);
+  const seatCount = (sh.manual ? sh.seats.length : Math.max(sh.people_per_shift, ...sh.seats.map((s) => s.seat + 1), 0));
   const seats = [];
   for (let i = 0; i < seatCount; i++) {
     const s = sh.seats.find((x) => x.seat === i) || { seat: i, person: null, pinned: false };
@@ -278,7 +311,7 @@ async function openShift(shiftId) {
         <div>
           <select ${past ? "disabled" : ""}>${memberOptions(team, sh, s.person?.id)}</select>
           ${s.pinned ? `<div class="pin">📌 закреплено вручную — планировщик не трогает</div>` : ""}
-          ${i >= sh.people_per_shift ? `<div class="muted">дополнительное место</div>` : ""}
+          ${!sh.manual && i >= sh.people_per_shift ? `<div class="muted">дополнительное место</div>` : ""}
         </div>
         <div class="acts">
           ${past ? "" : `<button class="btn small primary" data-act="assign">Назначить</button>`}
@@ -289,12 +322,16 @@ async function openShift(shiftId) {
       </div>`);
   }
   const problems = shiftProblems(sh);
-  const body = openDialog(`${sh.team_name}: смена`, `
+  const body = openDialog(`${sh.team_name}: ${sh.manual ? "ручное дежурство" : "смена"}`, `
     <div><b>${esc(range(sh.start, sh.end))}</b></div>
+    ${sh.manual ? `<p class="muted">✋ Период задан вручную — он вырезан из графика ротации. Если удалить, дни вернутся в график.</p>` : ""}
     ${past ? `<p class="muted">Смена уже прошла — только просмотр.</p>` : ""}
     ${problems.length ? `<ul class="changes">${problems.map((p) => `<li class="warn">⚠️ ${esc(p)}</li>`).join("")}</ul>` : ""}
     ${seats.join("")}
-    ${past ? "" : `<button class="btn ghost" id="add-seat">+ добавить дежурного сверх нормы</button>`}
+    ${past ? "" : `<div class="row" style="flex-wrap:wrap">
+       <button class="btn ghost" id="add-seat" style="flex:0">+ добавить дежурного сверх нормы</button>
+       <button class="btn ghost" id="part-manual" style="flex:0">Назначить на часть дней…</button>
+       ${sh.manual ? `<button class="btn danger" id="del-manual" style="flex:0">Удалить ручное дежурство</button>` : ""}</div>`}
     <details><summary class="muted">История изменений</summary><div class="log" id="shift-log">загрузка…</div></details>
   `);
 
@@ -325,6 +362,18 @@ async function openShift(shiftId) {
     }));
   });
 
+  const partBtn = body.querySelector("#part-manual");
+  if (partBtn) partBtn.onclick = () => {
+    const from = new Date(Math.max(new Date(sh.start), Date.now()));
+    openManualShift(isoDate(from), 1, sh.team);
+  };
+  const delBtn = body.querySelector("#del-manual");
+  if (delBtn) delBtn.onclick = () => guard(async () => {
+    if (!confirm("Удалить ручное дежурство? Эти дни вернутся в график ротации.")) return;
+    const r = await api("DELETE", `/shifts/${sh.id}`);
+    refresh();
+    openDialog("Ручное дежурство удалено", renderReports([r]), [{ text: "OK", cls: "primary", onClick: closeDialog }]);
+  });
   const addBtn = body.querySelector("#add-seat");
   if (addBtn) addBtn.onclick = () => {
     addBtn.outerHTML = `<div class="row"><select id="extra-sel">${memberOptions(team, sh, null)}</select>
@@ -346,10 +395,11 @@ async function openShift(shiftId) {
   }).catch(() => {});
 }
 
-async function finishSwap(target) {
+async function finishSwap(target, clickedSeat) {
   const src = state.swap;
   if (target.id === src.shift.id) return;
-  const filled = target.seats.filter((s) => s.person);
+  const clicked = target.seats.find((s) => s.seat === clickedSeat && s.person);
+  const filled = clicked ? [clicked] : target.seats.filter((s) => s.person);
   if (!filled.length) return toast("В выбранной смене никого нет", true);
   const doSwap = async (seatB, force = false) => {
     try {
@@ -429,23 +479,88 @@ $("#btn-absence").onclick = openAddAbsence;
 
 function openAbsence(a) {
   const endIncl = new Date(new Date(a.end).getTime() - 1);
-  openDialog("Отсутствие", `
-    <div><b>${esc(a.person.name)}</b> · ${esc(KINDS[a.kind] || a.kind)}</div>
-    <div>${esc(fmtDay.format(new Date(a.start)))} – ${esc(fmtDay.format(endIncl))}</div>
-    ${a.note ? `<div>${esc(a.note)}</div>` : ""}
+  const editable = a.source === "manual";
+  const payload = () => ({ start: $("#ab-start").value, end: $("#ab-end").value, kind: $("#ab-kind").value,
+                           note: $("#ab-note").value });
+  const done = (title, r) => {
+    refresh();
+    openDialog(title, renderReports(r.plans), [{ text: "OK", cls: "primary", onClick: closeDialog }]);
+  };
+  openDialog(`Отсутствие: ${a.person.name}`, `
+    ${editable ? `
+      <div class="grid2">
+        <label>С (включительно)<input type="date" id="ab-start" value="${a.start_day || isoDate(new Date(a.start))}"></label>
+        <label>По (включительно)<input type="date" id="ab-end" value="${a.end_day || isoDate(endIncl)}"></label>
+      </div>
+      <label>Тип<select id="ab-kind">${Object.entries(KINDS).map(([k, v]) => `<option value="${k}" ${k === a.kind ? "selected" : ""}>${v}</option>`).join("")}</select></label>
+      <label>Комментарий<input id="ab-note" maxlength="300" value="${esc(a.note)}"></label>`
+    : `<div>${esc(KINDS[a.kind] || a.kind)} · ${esc(fmtDay.format(new Date(a.start)))} – ${esc(fmtDay.format(endIncl))}</div>
+       ${a.note ? `<div>${esc(a.note)}</div>` : ""}
+       <p class="muted">Запись пришла из внешнего источника — меняется там.</p>`}
     <div class="muted">Источник: ${esc(a.source)}${a.created_by ? `, добавил ${esc(a.created_by)}` : ""}</div>
-    <div id="ab-preview"></div>`, [
-    { text: "Что изменится при удалении?", onClick: () => guard(async () => {
-      const r = await api("DELETE", `/absences/${a.id}`, undefined, { dry_run: true });
-      $("#ab-preview").innerHTML = renderReports(r.plans);
-    }) },
+    <div id="ab-preview"></div>`, editable ? [
     { text: "Удалить", cls: "danger", onClick: () => guard(async () => {
       if (!confirm("Удалить отсутствие?")) return;
-      const r = await api("DELETE", `/absences/${a.id}`);
+      done("Отсутствие удалено", await api("DELETE", `/absences/${a.id}`));
+    }) },
+    { text: "Что изменится?", onClick: () => guard(async () => {
+      const r = await api("PATCH", `/absences/${a.id}`, payload(), { dry_run: true });
+      $("#ab-preview").innerHTML = renderReports(r.plans);
+    }) },
+    { text: "Сохранить", cls: "primary", onClick: () => guard(async () => {
+      done("Отсутствие изменено", await api("PATCH", `/absences/${a.id}`, payload()));
+    }) },
+  ] : []);
+}
+
+/* ---------------------------------------------------------------- ручное дежурство */
+
+function openManualShift(startDate, days, teamSlug) {
+  const teams = state.teams.filter((t) => state.selected.has(t.slug));
+  if (!teams.length) return toast("Выберите команду слева", true);
+  let team = teamBySlug(teamSlug) || teams[0];
+  const addDays = (iso, n) => { const d = new Date(iso + "T00:00:00"); d.setDate(d.getDate() + n); return isoDate(d); };
+  const body = openDialog("Назначить дежурство вручную", `
+    <label>Команда<select id="ms-team">${teams.map((t) => `<option value="${esc(t.slug)}" ${t.slug === team.slug ? "selected" : ""}>${esc(t.name)}</option>`).join("")}</select></label>
+    <div class="grid2">
+      <label>С даты<input type="date" id="ms-date" value="${startDate}"></label>
+      <label>На сколько дней<input type="number" id="ms-days" min="1" max="366" value="${days}"></label>
+    </div>
+    <p class="muted" id="ms-range"></p>
+    <div><span class="muted">Кто дежурит:</span><div id="ms-people"></div></div>
+    <p class="muted">Период вырезается из графика ротации: соседние смены укорачиваются, люди в них не меняются.</p>`, [
+    { text: "Назначить", cls: "primary", onClick: () => guard(async () => {
+      const emails = [...body.querySelectorAll(".ms-p:checked")].map((c) => c.value);
+      if (!emails.length) return toast("Отметьте хотя бы одного человека", true);
+      const payload = { start_date: $("#ms-date").value, days: Number($("#ms-days").value), emails, force: false };
+      let r;
+      try {
+        r = await api("POST", `/teams/${team.slug}/shifts`, payload);
+      } catch (e) {
+        if (e.status === 409 && /force/.test(e.message) && confirm(e.message.replace(/Чтобы.*/, "") + "\n\nНазначить всё равно?")) {
+          r = await api("POST", `/teams/${team.slug}/shifts`, { ...payload, force: true });
+        } else throw e;
+      }
       refresh();
-      openDialog("Отсутствие удалено", renderReports(r.plans), [{ text: "OK", cls: "primary", onClick: closeDialog }]);
+      openDialog("Дежурство назначено", `<p>${esc(range(r.shift.start, r.shift.end))}: <b>${esc(r.shift.seats.map((x) => x.person?.name).join(", "))}</b></p>` +
+        renderReports([r.plan]), [{ text: "OK", cls: "primary", onClick: closeDialog }]);
     }) },
   ]);
+  const render = () => {
+    team = teamBySlug($("#ms-team").value);
+    const d = $("#ms-date").value, n = Math.max(1, Number($("#ms-days").value) || 1);
+    $("#ms-range").textContent = d ? `Смена: ${fmtDay.format(new Date(d + "T00:00:00"))} ${team.handoff_time} — ${fmtDay.format(new Date(addDays(d, n) + "T00:00:00"))} ${team.handoff_time} (время команды, ${team.timezone})` : "";
+    const checked = new Set([...body.querySelectorAll(".ms-p:checked")].map((c) => c.value));
+    const st = d ? new Date(d + "T00:00:00") : new Date(), en = d ? new Date(addDays(d, n) + "T00:00:00") : new Date();
+    $("#ms-people").innerHTML = team.members.map((m) => {
+      const person = state.people.find((p) => p.email === m.email);
+      const away = person && absencesOf(person.id, st, en).length;
+      return `<label class="inline"><input type="checkbox" class="ms-p" value="${esc(m.email)}" ${checked.has(m.email) ? "checked" : ""}>
+        <span><span class="team-dot" style="background:${person ? personColor(person.id) : "#999"}"></span>${esc(m.name)}${away ? ' <span class="muted">· отсутствует</span>' : ""}${m.active ? "" : ' <span class="muted">· выключен</span>'}</span></label>`;
+    }).join("") || `<p class="muted">В команде пока никого нет.</p>`;
+  };
+  ["#ms-team", "#ms-date", "#ms-days"].forEach((id) => $(id).addEventListener("input", render));
+  render();
 }
 
 /* ---------------------------------------------------------------- перепланирование */
@@ -457,7 +572,7 @@ $("#btn-replan").onclick = () => {
     <label class="inline"><input type="radio" name="rp-mode" value="fix" checked> Исправить — заменить только тех, кто не может дежурить</label>
     <label class="inline"><input type="radio" name="rp-mode" value="rebalance"> Перебалансировать — пересчитать будущее (кроме закреплённых)</label>
     <label>Не трогать смены в ближайшие N дней (для перебалансировки; 0 — всё, кроме уже начавшихся)
-      <input type="number" id="rp-freeze" min="0" placeholder="как в настройках команды"></label>
+      <input type="number" id="rp-freeze" min="0" value="0"></label>
     <div id="rp-preview"></div>`, [
     { text: "Предпросмотр", onClick: () => guard(async () => {
       const r = await api("POST", `/teams/${$("#rp-team").value}/plan`, undefined,
@@ -521,7 +636,7 @@ function teamForm(t) {
       <label>Дата начала сетки<input id="tf-anchor" type="date" value="${v("anchor_date", isoDate(new Date()))}"></label>
       <label>Часовой пояс<input id="tf-tz" value="${v("timezone", "Europe/Moscow")}"></label>
       <label>Планировать на N дней<input id="tf-hor" type="number" min="1" value="${v("horizon_days", 56)}"></label>
-      <label>Не трогать при перебалансировке, дней<input id="tf-frz" type="number" min="0" value="${v("freeze_days", 7)}"></label>
+      <label>Не трогать при перебалансировке, дней<input id="tf-frz" type="number" min="0" value="${v("freeze_days", 0)}"></label>
       <label>Сообщать о перестановках на N дней<input id="tf-ntf" type="number" min="0" value="${v("notify_days", 14)}"></label>
       <label>Частичное отсутствие<select id="tf-pol">
         <option value="whole" ${wd && t?.absence_policy !== "split" ? "selected" : ""}>переназначить всю смену</option>

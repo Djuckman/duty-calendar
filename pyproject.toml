@@ -1,0 +1,35 @@
+[project]
+name = "duty-calendar"
+version = "0.1.0"
+description = "Сервис-календарь дежурств: автоназначение с учётом отпусков, праздники РФ, Mattermost, REST API и MCP"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "sqlalchemy>=2.0",
+    "pydantic>=2.7",
+    "pydantic-settings>=2.3",
+    "apscheduler>=3.10,<4",
+    "httpx>=0.27",
+    "icalendar>=6",
+    "holidays>=0.60",
+    "fastmcp>=4.1,<5",
+]
+
+[project.optional-dependencies]
+postgres = ["psycopg[binary]>=3.2"]
+dev = ["pytest>=8", "playwright>=1.45"]
+
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["duty*"]
+
+[tool.setuptools.package-data]
+duty = ["static/*", "static/vendor/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

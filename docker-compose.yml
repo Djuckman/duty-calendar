@@ -1,0 +1,28 @@
+# Вариант по умолчанию — SQLite в volume. Для Postgres раскомментируйте сервис db
+# и DUTY_DATABASE_URL ниже.
+services:
+  duty:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    env_file: .env
+    volumes:
+      - duty-data:/data
+    # environment:
+    #   DUTY_DATABASE_URL: postgresql+psycopg://duty:duty@db:5432/duty
+    # depends_on: [db]
+
+  # db:
+  #   image: postgres:16
+  #   restart: unless-stopped
+  #   environment:
+  #     POSTGRES_USER: duty
+  #     POSTGRES_PASSWORD: duty
+  #     POSTGRES_DB: duty
+  #   volumes:
+  #     - pg-data:/var/lib/postgresql/data
+
+volumes:
+  duty-data:
+  # pg-data:

@@ -349,7 +349,8 @@ class DutyService:
         m = Membership(team=team, person=person, position=position, active=active)
         op.session.add(m)
         op.session.flush()
-        self._replan(op, team, "fix")
+        # Новый человек должен войти в очередь сразу: пересчитываем будущее (кроме закреплённых и начавшихся).
+        self._replan(op, team, "rebalance" if active else "fix", freeze_days=0)
         return m
 
     def update_member(self, op: Op, slug: str, email: str, active: bool | None = None, position: int | None = None):
@@ -359,12 +360,16 @@ class DutyService:
         m = self._membership(team, person.id)
         if m is None:
             raise NotFound(f"{email} не состоит в команде {slug}")
+        activated = active is True and not m.active
         if active is not None:
             m.active = active
         if position is not None:
             m.position = position
         op.session.flush()
-        self._replan(op, team, "fix")
+        if activated:
+            self._replan(op, team, "rebalance", freeze_days=0)
+        else:
+            self._replan(op, team, "fix")
         return m
 
     def remove_member(self, op: Op, slug: str, email: str) -> None:
@@ -635,14 +640,20 @@ class DutyService:
 
     # ------------------------------------------------------------ планирование
 
-    def plan_team(self, op: Op, slug: str, mode: str = "fix", dry_run: bool = False) -> PlanReport:
+    def plan_team(
+        self, op: Op, slug: str, mode: str = "fix", dry_run: bool = False, freeze_days: int | None = None
+    ) -> PlanReport:
+        """freeze_days — для rebalance: не трогать смены, начинающиеся в ближайшие N дней
+        (по умолчанию значение из настроек команды)."""
         if mode not in ("fix", "rebalance"):
             raise Invalid("mode: fix | rebalance")
+        if freeze_days is not None and freeze_days < 0:
+            raise Invalid("freeze_days не может быть отрицательным")
         team = self.get_team(op.session, slug)
         if dry_run:
-            result, by_id = self._compute(op.session, team, mode)
+            result, by_id = self._compute(op.session, team, mode, freeze_days=freeze_days)
             return self._report(op.session, team, result, mode, True, {})
-        return self._replan(op, team, mode)
+        return self._replan(op, team, mode, freeze_days=freeze_days)
 
     def plan_all(self, op: Op) -> list[PlanReport]:
         reports = []
@@ -666,10 +677,12 @@ class DutyService:
         mode: str,
         extra_absences: dict[int, list[Interval]] | None = None,
         skip_absence_ids: set[int] | None = None,
+        freeze_days: int | None = None,
     ) -> tuple[PlanResult, dict[int, Shift]]:
         now = self.now()
         window_end = now + timedelta(days=team.horizon_days)
-        kinds = self.day_kinds(s, (now - timedelta(days=team.shift_length_days + 1)).date(), window_end.date())
+        # производственный календарь нужен от даты отсчёта: по нему нумеруются дежурные дни
+        kinds = self.day_kinds(s, min(team.anchor_date, now.date()) - timedelta(days=1), window_end.date())
         slots = generate_slots(rule_for(team), now, window_end, kinds.get)
 
         shifts = list(s.scalars(
@@ -715,7 +728,7 @@ class DutyService:
             last_duty=last,
             duty_count=count,
             mode=mode,  # type: ignore[arg-type]
-            freeze_until=now + timedelta(days=team.freeze_days),
+            freeze_until=now + timedelta(days=team.freeze_days if freeze_days is None else freeze_days),
         )
         try:
             result = get_planner(team.absence_policy).plan(data)
@@ -786,8 +799,10 @@ class DutyService:
         s.flush()
         return by_start
 
-    def _replan(self, op: Op, team: Team, mode: str = "fix", notify: bool = True) -> PlanReport:
-        result, by_id = self._compute(op.session, team, mode)
+    def _replan(
+        self, op: Op, team: Team, mode: str = "fix", notify: bool = True, freeze_days: int | None = None
+    ) -> PlanReport:
+        result, by_id = self._compute(op.session, team, mode, freeze_days=freeze_days)
         by_start = self._apply(op, team, result, by_id)
         report = self._report(op.session, team, result, mode, False, by_start)
         if notify:

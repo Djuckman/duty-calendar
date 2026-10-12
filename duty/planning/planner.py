@@ -177,7 +177,12 @@ class BasePlanner(Planner):
         start: datetime,
         end: datetime,
         exclude: set[int],
+        prefer: list[int] | None = None,
     ) -> int | None:
+        # Продолжение смены, разорванной выходными: тот же человек, если может.
+        for pid in prefer or []:
+            if pid not in exclude and self.unavailability(data, members, pid, start, end) is None:
+                return pid
         candidates = [
             m
             for m in members.values()
@@ -200,6 +205,7 @@ class WholeShiftPlanner(BasePlanner):
         members = {m.person_id: m for m in data.members}
         last = dict(data.last_duty)
         count = dict(data.duty_count)
+        group_people: dict[int, list[int]] = {}  # group -> кто дежурил в предыдущем куске этой смены
         now = data.now
 
         existing_by_start = {e.start: e for e in data.existing}
@@ -271,7 +277,8 @@ class WholeShiftPlanner(BasePlanner):
 
             # 3) Заполняем по правилу «дольше всех не дежурил».
             for seat, old_pid, reason in to_fill:
-                new = self.pick(data, members, last, count, start, end, exclude=taken)
+                prefer = group_people.get(slot.group, []) if (on_grid and slot.group is not None) else []
+                new = self.pick(data, members, last, count, start, end, exclude=taken, prefer=prefer)
                 planned[seat] = PlannedSeat(seat, new, False)
                 if new is not None:
                     taken.add(new)
@@ -285,9 +292,14 @@ class WholeShiftPlanner(BasePlanner):
                         Conflict(ex.id if ex else None, start, end, seat, None, "unassigned", "нет доступных участников")
                     )
 
+            prev_group = set(group_people.get(slot.group, [])) if slot.group is not None else set()
             for pid in taken:
                 last[pid] = max(last.get(pid, EPOCH), start)
-                count[pid] = count.get(pid, 0) + 1
+                if pid not in prev_group:  # кусок той же смены не считаем отдельной сменой
+                    count[pid] = count.get(pid, 0) + 1
+            if on_grid and slot.group is not None:
+                group_people[slot.group] = [planned[k].person_id for k in sorted(planned)
+                                            if planned[k].person_id is not None]
             res.shifts.append(
                 PlannedShift(start, end, ex.id if ex else None, [planned[k] for k in sorted(planned)])
             )

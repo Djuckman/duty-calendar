@@ -192,14 +192,17 @@ def build_mcp(svc: DutyService, resolve_user: Callable[[], User | None] = _heade
         return call(run)
 
     @mcp.tool
-    def replan(team: str, mode: Literal["fix", "rebalance"] = "fix", dry_run: bool = True) -> dict:
-        """Перепланировать команду. fix — исправить только сломанные смены; rebalance — пересчитать будущее
-        (кроме закреплённых и ближайших freeze_days). По умолчанию dry_run=true."""
+    def replan(
+        team: str, mode: Literal["fix", "rebalance"] = "fix", dry_run: bool = True, freeze_days: int | None = None
+    ) -> dict:
+        """Перепланировать команду. fix — исправить только сломанные смены; rebalance — пересчитать будущее,
+        кроме закреплённых и смен в ближайшие freeze_days дней (по умолчанию — из настроек команды,
+        0 — пересчитать всё, кроме уже начавшихся). По умолчанию dry_run=true."""
         u = user()
 
         def run():
             with svc.write(u) as op:
-                return _dump(S.report_out(svc.plan_team(op, team, mode, dry_run)))
+                return _dump(S.report_out(svc.plan_team(op, team, mode, dry_run, freeze_days)))
 
         return call(run)
 

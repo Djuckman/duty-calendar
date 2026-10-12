@@ -210,9 +210,10 @@ def oncall(slug: str, user: CurrentUser, svc: Svc, at: datetime | None = None):
 
 
 @router.post("/teams/{slug}/plan", response_model=S.PlanReportOut, tags=["shifts"])
-def plan_team(slug: str, user: CurrentUser, svc: Svc, mode: str = "fix", dry_run: bool = False):
+def plan_team(slug: str, user: CurrentUser, svc: Svc, mode: str = "fix", dry_run: bool = False,
+              freeze_days: int | None = None):
     with svc.write(user) as op:
-        return S.report_out(svc.plan_team(op, slug, mode, dry_run))
+        return S.report_out(svc.plan_team(op, slug, mode, dry_run, freeze_days))
 
 
 @router.get("/teams/{slug}/calendar.ics", tags=["shifts"])

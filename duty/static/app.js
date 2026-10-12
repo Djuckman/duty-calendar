@@ -210,6 +210,8 @@ function initCalendar() {
     views: { listMonth: { buttonText: "Список" } },
     eventTimeFormat: { hour: "2-digit", minute: "2-digit", hour12: false },
     displayEventEnd: false, dayMaxEvents: 6, nowIndicator: true,
+    // смена «пн 11:00 – ср 11:00» занимает пн и вт, а не залезает на среду (утро дня передачи)
+    nextDayThreshold: "23:59:59",
     eventOrder: (a, b) => (a.extendedProps.type === "shift" ? 0 : 1) - (b.extendedProps.type === "shift" ? 0 : 1),
     datesSet: (info) => store("duty.view", info.view.type),
     events: async (info, success, failure) => {
@@ -453,16 +455,18 @@ $("#btn-replan").onclick = () => {
   openDialog("Перепланировать", `
     <label>Команда<select id="rp-team">${state.teams.map((t) => `<option value="${esc(t.slug)}">${esc(t.name)}</option>`).join("")}</select></label>
     <label class="inline"><input type="radio" name="rp-mode" value="fix" checked> Исправить — заменить только тех, кто не может дежурить</label>
-    <label class="inline"><input type="radio" name="rp-mode" value="rebalance"> Перебалансировать — пересчитать будущее (кроме закреплённых и ближайших дней)</label>
+    <label class="inline"><input type="radio" name="rp-mode" value="rebalance"> Перебалансировать — пересчитать будущее (кроме закреплённых)</label>
+    <label>Не трогать смены в ближайшие N дней (для перебалансировки; 0 — всё, кроме уже начавшихся)
+      <input type="number" id="rp-freeze" min="0" placeholder="как в настройках команды"></label>
     <div id="rp-preview"></div>`, [
     { text: "Предпросмотр", onClick: () => guard(async () => {
       const r = await api("POST", `/teams/${$("#rp-team").value}/plan`, undefined,
-        { mode: document.querySelector("[name=rp-mode]:checked").value, dry_run: true });
+        { mode: document.querySelector("[name=rp-mode]:checked").value, dry_run: true, freeze_days: $("#rp-freeze").value || undefined });
       $("#rp-preview").innerHTML = renderReports([r]);
     }) },
     { text: "Применить", cls: "primary", onClick: () => guard(async () => {
       const r = await api("POST", `/teams/${$("#rp-team").value}/plan`, undefined,
-        { mode: document.querySelector("[name=rp-mode]:checked").value });
+        { mode: document.querySelector("[name=rp-mode]:checked").value, freeze_days: $("#rp-freeze").value || undefined });
       refresh();
       openDialog("Готово", renderReports([r]), [{ text: "OK", cls: "primary", onClick: closeDialog }]);
     }) },
@@ -511,7 +515,7 @@ function teamForm(t) {
     <div class="grid2">
       ${t ? "" : `<label>Код (латиница, для URL)<input id="tf-slug" placeholder="backend"></label>`}
       <label>Название<input id="tf-name" value="${v("name")}"></label>
-      <label>Длина смены, дней<input id="tf-len" type="number" min="1" value="${v("shift_length_days", 7)}"></label>
+      <label>Длина смены, дежурных дней<input id="tf-len" type="number" min="1" value="${v("shift_length_days", 7)}"></label>
       <label>Дежурных на смену<input id="tf-ppl" type="number" min="1" max="20" value="${v("people_per_shift", 1)}"></label>
       <label>Время передачи смены<input id="tf-hand" type="time" value="${v("handoff_time", "10:00")}"></label>
       <label>Дата начала сетки<input id="tf-anchor" type="date" value="${v("anchor_date", isoDate(new Date()))}"></label>
@@ -525,9 +529,10 @@ function teamForm(t) {
       <label>Mattermost webhook<input id="tf-mm" value="${v("mattermost_webhook")}" placeholder="https://mm/hooks/..."></label>
       <label>Канал Mattermost (необязательно)<input id="tf-mmc" value="${v("mattermost_channel")}"></label>
     </div>
-    <div><span class="muted">Дни начала смены:</span>
+    <div><span class="muted">Дежурные дни недели:</span>
       ${WD.map((d, i) => `<label class="inline" style="display:inline-flex;margin-right:8px"><input type="checkbox" class="tf-wd" value="${i + 1}" ${wd.includes(String(i + 1)) ? "checked" : ""}>${d}</label>`).join("")}</div>
-    <label class="inline"><input type="checkbox" id="tf-skip" ${t?.skip_holidays ? "checked" : ""}> Не начинать смены в праздники и выходные по производственному календарю</label>`;
+    <label class="inline"><input type="checkbox" id="tf-skip" ${t?.skip_holidays ?? true ? "checked" : ""}> Учитывать производственный календарь: праздники и перенесённые выходные — не дежурные дни, рабочие субботы — дежурные</label>
+    <p class="muted">Смена длится N <b>дежурных</b> дней (отмеченные дни недели). Если смену разрывают выходные или праздник, она продолжается после них у того же человека: например, при 2 днях и Пн–Пт — «пт + пн».</p>`;
 }
 
 function teamPayload() {

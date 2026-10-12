@@ -249,3 +249,18 @@ def test_decrease_seats_removes_extra_unpinned():
     res = plan(NOW, weeks(2), existing=as_existing(first), seats=1)
     assert who(res) == [A, C]
     assert [c.reason for c in res.changes] == ["removed", "removed"]
+
+
+def test_business_days_two_day_shifts_split_by_weekend_share_group():
+    rule = weekly_rule(shift_length_days=2, weekdays="12345", anchor_date=date(2026, 10, 12))
+    slots = generate_slots(rule, utc(2026, 10, 12), utc(2026, 10, 24))
+    days = [(s.start.date().day, s.end.date().day, s.group) for s in slots]
+    # пн-вт, ср-чт, пт (+ пн след. недели — тот же group), вт-ср, чт-пт
+    assert days == [(12, 14, 0), (14, 16, 1), (16, 17, 2), (19, 20, 2), (20, 22, 3), (22, 24, 4)]
+
+
+def test_group_continuation_keeps_same_person():
+    rule = weekly_rule(shift_length_days=2, weekdays="12345", anchor_date=date(2026, 10, 12))
+    slots = generate_slots(rule, utc(2026, 10, 12), utc(2026, 10, 24))
+    res = plan(NOW, slots)
+    assert who(res) == [A, B, C, C, A, B]

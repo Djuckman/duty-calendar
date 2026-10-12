@@ -1,4 +1,5 @@
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -159,3 +160,45 @@ def test_announce_and_publish(team, admin, service, clock, notifier):
 def test_mcp_requires_token(client):
     r = client.post("/mcp/", json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
     assert r.status_code == 401
+
+
+def test_business_days_two_day_rotation_after_adding_people_one_by_one(admin, service, clock):
+    """Сценарий из жалобы: 2-дневная ротация по будням, люди добавляются по одному."""
+    clock.now = datetime(2026, 10, 12, 18, 26, tzinfo=UTC)
+    with service.write() as op:
+        service.sync_holidays(op, [2026])
+    r = admin.post("/api/v1/teams", json={"slug": "ops2", "shift_length_days": 2, "weekdays": "12345",
+                                          "skip_holidays": True, "handoff_time": "11:00",
+                                          "anchor_date": "2026-10-12", "horizon_days": 35})
+    assert r.status_code == 201, r.text
+    for login in ["djuckman", "roma", "egor", "enot"]:
+        admin.post("/api/v1/teams/ops2/members", json={"email": f"{login}@x.ru", "name": login})
+    shifts = admin.get("/api/v1/shifts", params={"team": "ops2", "start": "2026-10-12T00:00:00Z",
+                                                 "end": "2026-11-15T00:00:00Z"}).json()
+    msk = ZoneInfo("Europe/Moscow")
+    rows = []
+    for sh in shifts:
+        st = datetime.fromisoformat(sh["start"]).astimezone(msk)
+        en = datetime.fromisoformat(sh["end"]).astimezone(msk)
+        rows.append((st, en, sh["seats"][0]["person"]["name"]))
+    # ни одна смена не захватывает выходные и 4 ноября
+    for st, en, _ in rows:
+        day = st.date()
+        while day < en.date():
+            assert day.isoweekday() <= 5 and day != date(2026, 11, 4), (st, en)
+            day += timedelta(days=1)
+    # смены не пересекаются
+    for (s1, e1, _), (s2, e2, _) in zip(rows, rows[1:]):
+        assert e1 <= s2
+    # текущую (уже начавшуюся) смену не трогаем, дальше — честная очередь без повторов подряд
+    people = [p for _, _, p in rows]
+    assert people[0] == "djuckman"
+    groups = []
+    for (st, en, p) in rows:  # склеиваем куски одной смены, разорванные выходными/праздником (пт + пн)
+        if groups and groups[-1][1] == p and groups[-1][2] < st:
+            groups[-1] = (groups[-1][0], p, en)
+        else:
+            groups.append((st, p, en))
+    seq = [p for _, p, _ in groups]
+    assert all(a != b for a, b in zip(seq, seq[1:])), seq
+    assert seq[1:5] and len(set(seq[1:5])) == 4, seq

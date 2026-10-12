@@ -30,6 +30,7 @@ class RotationRule:
 class Slot:
     start: datetime  # aware UTC
     end: datetime  # aware UTC
+    group: int | None = None  # номер ротации: куски одной смены, разорванные выходными, имеют общий group
 
 
 def parse_hhmm(value: str) -> time:
@@ -48,39 +49,72 @@ def generate_slots(
 ) -> list[Slot]:
     """Смены, пересекающиеся с окном [window_start, window_end).
 
-    Сетка: смена k начинается в день anchor_date + k * shift_length_days в handoff_time
-    по локальному времени команды и длится shift_length_days суток (по «настенным» часам,
-    поэтому переходы на летнее время не сдвигают передачу смены).
+    Смена длится shift_length_days *дежурных* дней и передаётся в handoff_time по локальному
+    времени команды (по «настенным» часам, поэтому переход на летнее время не сдвигает передачу).
 
-    Фильтры применяются к дню начала смены:
-      * день недели должен входить в weekdays;
-      * при skip_holidays праздники и перенесённые выходные пропускаются, а перенесённые
-        рабочие дни (рабочая суббота) наоборот разрешены, даже если их нет в weekdays.
+    Дежурные дни:
+      * день недели входит в weekdays;
+      * при skip_holidays праздники и перенесённые выходные не дежурные, а перенесённые рабочие
+        дни (рабочая суббота) — дежурные, даже если их нет в weekdays.
     day_kind(day) возвращает тип дня по производственному календарю:
     'holiday' | 'dayoff' | 'workday' | 'short' | None.
-    Для дежурств «только по рабочим дням» используйте shift_length_days = 1, weekdays = 12345.
+
+    Если дежурные все дни подряд (weekdays=1234567, skip_holidays=False) — обычная сетка
+    24/7: смена k начинается в anchor_date + k * shift_length_days.
+    Иначе дежурные дни нумеруются от anchor_date и режутся по shift_length_days штук; смена
+    никогда не захватывает недежурные дни: если её дни разорваны выходными/праздником, она
+    состоит из нескольких кусков с общим group (планировщик ставит на них одного человека).
+    Пример: 2 дня, пн–пт → [пн–вт] [ср–чт] [пт + пн] [вт–ср] ...
     """
     tz = ZoneInfo(rule.timezone)
     handoff = parse_hhmm(rule.handoff_time)
     n = rule.shift_length_days
     allowed = {int(c) for c in rule.weekdays}
 
-    local_start_day = window_start.astimezone(tz).date()
-    k = (local_start_day - rule.anchor_date).days // n - 1  # с запасом в одну смену назад
-    k = max(k, 0)
+    def at(day: date) -> datetime:
+        return datetime.combine(day, handoff, tz).astimezone(UTC)
 
     slots: list[Slot] = []
-    while True:
-        day = rule.anchor_date + timedelta(days=k * n)
-        start = datetime.combine(day, handoff, tz).astimezone(UTC)
-        if start >= window_end:
-            break
-        end = datetime.combine(day + timedelta(days=n), handoff, tz).astimezone(UTC)
-        k += 1
-        if end <= window_start:
-            continue
+
+    if allowed == set(range(1, 8)) and not rule.skip_holidays:
+        local_start_day = window_start.astimezone(tz).date()
+        k = max((local_start_day - rule.anchor_date).days // n - 1, 0)  # с запасом в одну смену назад
+        while True:
+            day = rule.anchor_date + timedelta(days=k * n)
+            start = at(day)
+            if start >= window_end:
+                break
+            end = at(day + timedelta(days=n))
+            if end > window_start:
+                slots.append(Slot(start, end, k))
+            k += 1
+        return slots
+
+    # Нумерация дежурных дней от anchor_date и нарезка на куски без недежурных дней.
+    last_day = window_end.astimezone(tz).date() + timedelta(days=1)
+    idx = 0
+    seg_first: date | None = None
+    seg_last: date | None = None
+    seg_group = -1
+
+    def flush():
+        if seg_first is not None:
+            start, end = at(seg_first), at(seg_last + timedelta(days=1))
+            if end > window_start and start < window_end:
+                slots.append(Slot(start, end, seg_group))
+
+    day = rule.anchor_date
+    while day <= last_day:
         if day_allowed(rule, day, allowed, day_kind):
-            slots.append(Slot(start, end))
+            group = idx // n
+            idx += 1
+            if seg_first is not None and group == seg_group and seg_last == day - timedelta(days=1):
+                seg_last = day
+            else:
+                flush()
+                seg_first, seg_last, seg_group = day, day, group
+        day += timedelta(days=1)
+    flush()
     return slots
 
 

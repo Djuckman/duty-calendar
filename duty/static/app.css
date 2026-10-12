@@ -10,6 +10,8 @@
   --danger-weak: #fdecef;
   --absence: #8a8f98;
   --holiday: #fde7e9;
+  --weekend: #f1f3f6;
+  --weekend-text: #b4233c;
   --radius: 8px;
   --shadow: 0 8px 28px rgba(0, 0, 0, .14);
   font-family: "Segoe UI", system-ui, -apple-system, Roboto, Arial, sans-serif;
@@ -20,7 +22,7 @@
   :root {
     --bg: #17191c; --panel: #212429; --text: #e6e8eb; --muted: #9aa4b0; --line: #343840;
     --accent: #4aa3ff; --accent-weak: #1d2a3a; --danger: #ff6b81; --danger-weak: #3a1f25;
-    --absence: #737a85; --holiday: #3a2226;
+    --absence: #737a85; --holiday: #3a2226; --weekend: #2a2e35; --weekend-text: #ff8a9b;
   }
 }
 * { box-sizing: border-box; }
@@ -86,6 +88,7 @@ label.inline input { width: auto; }
 .sw-problem { background: var(--danger); }
 .sw-absence { background: transparent; border: 1px dashed var(--absence); }
 .sw-holiday { background: var(--holiday); }
+.sw-weekend { background: var(--weekend); border: 1px solid var(--line); }
 
 .user-menu { position: relative; }
 .menu {
@@ -105,6 +108,11 @@ label.inline input { width: auto; }
       --fc-button-active-border-color: var(--accent); --fc-list-event-hover-bg-color: var(--accent-weak); }
 .fc .fc-button-primary:not(:disabled).fc-button-active { color: #fff; }
 .fc .fc-toolbar-title { font-size: 18px; font-weight: 600; }
+.fc .fc-daygrid-day.fc-day-sat, .fc .fc-daygrid-day.fc-day-sun,
+.fc .fc-timegrid-col.fc-day-sat, .fc .fc-timegrid-col.fc-day-sun { background: var(--weekend); }
+.fc .fc-col-header-cell.fc-day-sat, .fc .fc-col-header-cell.fc-day-sun,
+.fc .fc-day-sat .fc-daygrid-day-number, .fc .fc-day-sun .fc-daygrid-day-number { color: var(--weekend-text); }
+.fc .fc-daygrid-day.fc-day-today, .fc .fc-timegrid-col.fc-day-today { background: var(--fc-today-bg-color); }
 .fc-event { cursor: pointer; }
 .fc-event.ev-pinned { box-shadow: inset 3px 0 0 #f2b705; }
 .fc-event.ev-problem { background: var(--danger) !important; border-color: var(--danger) !important; }

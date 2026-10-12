@@ -1,1 +1,70 @@
-<!doctype html><html lang="ru"><meta charset="utf-8"><title>Дежурства</title><body>UI</body></html>
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Дежурства</title>
+  <link rel="stylesheet" href="/static/app.css">
+  <script src="/static/vendor/fullcalendar.min.js"></script>
+  <script src="/static/vendor/fullcalendar-ru.min.js"></script>
+</head>
+<body>
+  <!-- Вход -->
+  <section id="login-view" class="login" hidden>
+    <form id="login-form" class="card login-card">
+      <h1>Дежурства</h1>
+      <label>Логин<input name="username" autocomplete="username" required></label>
+      <label>Пароль<input name="password" type="password" autocomplete="current-password" required></label>
+      <button class="btn primary" type="submit">Войти</button>
+      <p class="error" id="login-error" hidden></p>
+    </form>
+  </section>
+
+  <!-- Приложение -->
+  <div id="app-view" class="app" hidden>
+    <header class="topbar">
+      <button class="icon-btn only-mobile" id="toggle-side" aria-label="Панель">☰</button>
+      <div class="brand">Дежурства</div>
+      <div class="top-actions">
+        <button class="btn" id="btn-absence">+ Отсутствие</button>
+        <button class="btn" id="btn-replan">Перепланировать</button>
+        <button class="btn ghost" id="btn-admin" hidden>Команды</button>
+        <div class="user-menu">
+          <button class="btn ghost" id="btn-user"></button>
+          <div class="menu" id="user-menu" hidden>
+            <button id="btn-tokens">Токены API / MCP</button>
+            <button id="btn-logout">Выйти</button>
+          </div>
+        </div>
+      </div>
+    </header>
+
+    <aside class="side" id="side">
+      <h3>Сейчас дежурят</h3>
+      <div id="oncall-list" class="oncall-list"></div>
+      <h3>Команды</h3>
+      <div id="team-filter" class="team-filter"></div>
+      <h3>Обозначения</h3>
+      <ul class="legend">
+        <li><span class="sw sw-shift"></span>смена</li>
+        <li><span class="sw sw-pinned"></span>📌 закреплено вручную</li>
+        <li><span class="sw sw-problem"></span>есть проблема (пустое место, отпуск)</li>
+        <li><span class="sw sw-absence"></span>отсутствие</li>
+        <li><span class="sw sw-holiday"></span>праздник / выходной</li>
+      </ul>
+    </aside>
+
+    <main class="main">
+      <div id="swap-banner" class="banner" hidden>
+        Выберите вторую смену для обмена… <button class="btn ghost" id="swap-cancel">Отмена</button>
+      </div>
+      <div id="calendar"></div>
+    </main>
+  </div>
+
+  <dialog id="dlg" class="dlg"><div id="dlg-body"></div></dialog>
+  <div id="toast" class="toast" hidden></div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

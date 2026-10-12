@@ -14,9 +14,9 @@ ExchangePublisher(CalendarPublisher):
               среди папок Calendar; если нет — Calendar(parent=account.calendar, name=...).save())
     publish:
         если shift.external_id: item = account.fetch(ids=[(external_id, None)]), иначе CalendarItem(folder=folder)
-        item.subject = f"Дежурство {team.name}: {shift.person_name or 'НЕ НАЗНАЧЕН'}"
+        item.subject = f"Дежурство {team.name}: " + (", ".join(a.name for a in shift.attendees) or "НЕ НАЗНАЧЕН")
         item.start/end = EWSDateTime.from_datetime(...)
-        item.required_attendees = [shift.person_email] if shift.person_email else []
+        item.required_attendees = [a.email for a in shift.attendees]
         item.legacy_free_busy_status = exchange_free_busy_status
         создание: item.save(send_meeting_invitations=SEND_TO_ALL_AND_SAVE_COPY)
         изменение: item.save(update_fields=[...], send_meeting_invitations=SEND_TO_CHANGED_AND_SAVE_COPY)

@@ -223,7 +223,7 @@ class WholeShiftPlanner(BasePlanner):
 
         for start in sorted(items):
             slot, ex, on_grid = items[start]
-            end = ex.end if ex else slot.end
+            end = slot.end if on_grid else ex.end  # при смене длины ротации конец берём из новой сетки
             started = start <= now
             frozen = data.freeze_until is not None and start < data.freeze_until
             old_seats = {s.seat: s for s in (ex.seats if ex else ())}

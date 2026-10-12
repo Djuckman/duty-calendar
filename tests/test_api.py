@@ -1,0 +1,161 @@
+from datetime import UTC, datetime, timedelta
+
+import pytest
+
+
+def names(shifts):
+    return [[s["person"]["name"] if s["person"] else None for s in sh["seats"]] for sh in shifts]
+
+
+def get_shifts(client, team="sec"):
+    r = client.get("/api/v1/shifts", params={"team": team, "start": "2026-10-01T00:00:00Z",
+                                             "end": "2026-11-20T00:00:00Z"})
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
+def test_requires_login(client):
+    assert client.get("/api/v1/teams").status_code == 401
+    assert client.post("/api/v1/auth/login", json={"username": "admin", "password": "wrong"}).status_code == 403
+
+
+def test_rotation_created(team, admin):
+    shifts = get_shifts(admin)
+    assert names(shifts)[:6] == [["Аня"], ["Боря"], ["Вика"], ["Аня"], ["Боря"], ["Вика"]]
+    assert shifts[0]["start"].startswith("2026-10-05T07:00:00")
+
+
+def test_absence_dry_run_then_apply(team, admin, notifier):
+    body = {"email": "b@x.ru", "start": "2026-10-13", "end": "2026-10-14", "kind": "vacation"}
+    r = admin.post("/api/v1/absences", params={"dry_run": True}, json=body)
+    assert r.status_code == 200, r.text
+    plan = r.json()["plans"][0]
+    assert r.json()["absence"] is None
+    assert [(c["old"]["name"], c["new"]["name"], c["reason"]) for c in plan["changes"]] == [("Боря", "Вика", "absent")]
+    assert names(get_shifts(admin))[1] == ["Боря"]  # dry run ничего не поменял
+
+    notifier.messages.clear()
+    r = admin.post("/api/v1/absences", json=body)
+    assert r.status_code == 200
+    assert names(get_shifts(admin))[1] == ["Вика"]
+    assert any("@borya → @vika" in m[1] for m in notifier.messages)
+
+    absence_id = r.json()["absence"]["id"]
+    r = admin.delete(f"/api/v1/absences/{absence_id}", params={"dry_run": True})
+    assert r.json()["plans"][0]["changes"] == []  # fix-режим не возвращает Борю: смена валидна у Вики
+
+
+def test_manual_assign_pins_and_checks_absence(team, admin):
+    shifts = get_shifts(admin)
+    sid = shifts[0]["id"]
+    admin.post("/api/v1/absences", json={"email": "c@x.ru", "start": "2026-10-06", "end": "2026-10-07"})
+    r = admin.post(f"/api/v1/shifts/{sid}/assign", json={"email": "c@x.ru", "seat": 0})
+    assert r.status_code == 409 and "отсутствует" in r.json()["detail"]
+    r = admin.post(f"/api/v1/shifts/{sid}/assign", json={"email": "c@x.ru", "seat": 0, "force": True})
+    assert r.status_code == 200
+    assert r.json()["seats"][0] == {"seat": 0, "person": r.json()["seats"][0]["person"], "pinned": True}
+    # закреплённое место планировщик не трогает, но сообщает конфликт
+    plan = admin.post("/api/v1/teams/sec/plan", params={"dry_run": True}).json()
+    assert any(c["reason"] == "absent" and c["shift_id"] == sid for c in plan["conflicts"])
+    # открепляем — планировщик переназначает
+    r = admin.post(f"/api/v1/shifts/{sid}/unpin", json={"seat": 0})
+    assert r.json()["seats"][0]["person"]["name"] != "Вика"
+
+
+def test_assign_extra_seat_and_free_it(team, admin):
+    sid = get_shifts(admin)[0]["id"]
+    r = admin.post(f"/api/v1/shifts/{sid}/assign", json={"email": "b@x.ru"})  # seat=None → доп. место
+    assert [s["person"]["name"] for s in r.json()["seats"]] == ["Аня", "Боря"]
+    r = admin.post(f"/api/v1/shifts/{sid}/assign", json={"email": "a@x.ru", "seat": 1})
+    assert r.status_code == 409  # Аня уже в смене
+    r = admin.post(f"/api/v1/shifts/{sid}/assign", json={"email": None, "seat": 1})
+    assert len(r.json()["seats"]) == 1
+
+
+def test_swap(team, admin):
+    s = get_shifts(admin)
+    r = admin.post("/api/v1/shifts/swap", json={"shift_a": s[0]["id"], "shift_b": s[1]["id"]})
+    assert r.status_code == 200, r.text
+    assert names(get_shifts(admin))[:2] == [["Боря"], ["Аня"]]
+    log = admin.get(f"/api/v1/shifts/{s[0]['id']}/log").json()
+    assert log[-1]["reason"] == "swap" and log[-1]["actor"] == "admin"
+
+
+def test_two_people_per_shift(team, admin):
+    r = admin.patch("/api/v1/teams/sec", json={"people_per_shift": 2})
+    assert r.status_code == 200, r.text
+    shifts = get_shifts(admin)
+    assert all(len(sh["seats"]) == 2 for sh in shifts)
+    assert all(len({p for p in n}) == 2 for n in names(shifts))
+
+
+def test_change_rotation_length_regenerates_grid(team, admin):
+    r = admin.patch("/api/v1/teams/sec", json={"shift_length_days": 2})
+    assert r.status_code == 200
+    shifts = get_shifts(admin)
+    lengths = {(datetime.fromisoformat(s["end"]) - datetime.fromisoformat(s["start"])).days for s in shifts}
+    assert lengths == {2}
+
+
+def test_split_policy_not_implemented(team, admin):
+    r = admin.patch("/api/v1/teams/sec", json={"absence_policy": "split"})
+    assert r.status_code == 422 and "split" in r.json()["detail"]
+    assert admin.get("/api/v1/teams/sec").json()["absence_policy"] == "whole"
+
+
+def test_daily_business_days_skip_holidays(admin, service):
+    with service.write() as op:
+        service.sync_holidays(op, [2026])
+    r = admin.post("/api/v1/teams", json={"slug": "ops", "shift_length_days": 1, "weekdays": "12345",
+                                          "skip_holidays": True, "anchor_date": "2026-11-02", "horizon_days": 60})
+    assert r.status_code == 201, r.text
+    admin.post("/api/v1/teams/ops/members", json={"email": "a@x.ru", "name": "Аня"})
+    r = admin.get("/api/v1/shifts", params={"team": "ops", "start": "2026-11-02T00:00:00Z",
+                                            "end": "2026-11-09T00:00:00Z"})
+    days = [datetime.fromisoformat(s["start"]).day for s in r.json()]
+    assert days == [2, 3, 5, 6]  # 4 ноября — праздник, выходные пропущены
+
+
+def test_roles(team, admin, client):
+    r = admin.post("/api/v1/users", json={"username": "ivan", "password": "ivan-pass-1", "role": "user"})
+    assert r.status_code == 201
+    admin.post("/api/v1/auth/logout")
+    r = client.post("/api/v1/auth/login", json={"username": "ivan", "password": "ivan-pass-1"})
+    assert r.status_code == 200
+    assert client.post("/api/v1/teams", json={"slug": "x2"}).status_code == 403
+    assert client.post("/api/v1/teams/sec/members", json={"email": "z@x.ru", "name": "Z"}).status_code == 403
+    r = client.post("/api/v1/absences", json={"email": "a@x.ru", "start": "2026-12-01", "end": "2026-12-02"})
+    assert r.status_code == 200
+    assert r.json()["absence"]["created_by"] == "ivan"
+
+
+def test_personal_token_and_ics(team, admin, client):
+    r = admin.post("/api/v1/me/tokens", json={"name": "mcp"})
+    raw = r.json()["token"]
+    client.cookies.clear()
+    assert client.get("/api/v1/me", headers={"Authorization": f"Bearer {raw}"}).json()["username"] == "admin"
+    r = client.get("/api/v1/teams/sec/calendar.ics", params={"token": raw})
+    assert r.status_code == 200 and b"BEGIN:VEVENT" in r.content and "Дежурство SEC".encode() in r.content
+    assert client.get("/api/v1/teams/sec/calendar.ics").status_code == 401
+
+
+def test_calendar_endpoint_has_holidays(team, admin):
+    r = admin.get("/api/v1/calendar", params={"start": "2026-11-01T00:00:00Z", "end": "2026-11-30T00:00:00Z"})
+    body = r.json()
+    assert any(h["day"] == "2026-11-04" for h in body["holidays"])
+    assert body["shifts"]
+
+
+def test_announce_and_publish(team, admin, service, clock, notifier):
+    clock.now = datetime(2026, 10, 5, 8, 0, tzinfo=UTC)
+    notifier.messages.clear()
+    assert service.announce_tick() == 1
+    assert "началась смена" in notifier.messages[-1][1] and "@anya" in notifier.messages[-1][1]
+    assert service.announce_tick() == 0  # повторно не объявляем
+    assert service.publish_pending() > 0
+    assert service.publish_pending() == 0
+
+
+def test_mcp_requires_token(client):
+    r = client.post("/mcp/", json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+    assert r.status_code == 401

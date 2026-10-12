@@ -24,12 +24,18 @@ class PublishTeam:
 
 
 @dataclass(frozen=True)
+class Attendee:
+    email: str
+    name: str
+
+
+@dataclass(frozen=True)
 class PublishShift:
     shift_id: int
     start: datetime
     end: datetime
-    person_email: str | None  # None = смена не назначена
-    person_name: str | None
+    attendees: tuple[Attendee, ...]  # все дежурные смены; пусто = никто не назначен
+    seats: int  # сколько дежурных должно быть
     external_id: str | None  # id ранее созданного события
     url: str  # ссылка на смену в веб-интерфейсе
 
@@ -64,7 +70,8 @@ class LogPublisher(CalendarPublisher):
     name = "log"
 
     def publish(self, team, shift):
-        log.info("publish %s shift=%s %s..%s -> %s", team.slug, shift.shift_id, shift.start, shift.end, shift.person_email)
+        who = ", ".join(a.email for a in shift.attendees) or "НЕ НАЗНАЧЕН"
+        log.info("publish %s shift=%s %s..%s -> %s", team.slug, shift.shift_id, shift.start, shift.end, who)
         return shift.external_id or f"log-{shift.shift_id}"
 
     def unpublish(self, team, external_id):

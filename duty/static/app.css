@@ -175,3 +175,8 @@ table.simple td, table.simple th { padding: 6px 4px; border-bottom: 1px solid va
   .fc .fc-toolbar { flex-direction: column; gap: 8px; }
 }
 #people-block h3 { margin-top: 18px; }
+
+.dlg-confirm { width: min(420px, calc(100vw - 32px)); }
+.dlg-confirm .msg { margin: 4px 0; white-space: pre-line; line-height: 1.45; }
+.btn.danger-fill { background: var(--danger); border-color: var(--danger); color: #fff; }
+.people-pick { display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 2px 12px; }

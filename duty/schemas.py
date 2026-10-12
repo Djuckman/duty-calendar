@@ -311,6 +311,7 @@ class EventIn(BaseModel):
     description: str = ""
     color: str = "#e5a50a"
     team: str | None = Field(None, description="slug команды; null — событие для всех")
+    emails: list[str] = Field(default_factory=list, description="Участники события")
 
 
 class EventPatch(BaseModel):
@@ -320,6 +321,7 @@ class EventPatch(BaseModel):
     description: str | None = None
     color: str | None = None
     team: str | None = None
+    emails: list[str] | None = None
 
 
 class EventOut(BaseModel):
@@ -333,6 +335,7 @@ class EventOut(BaseModel):
     end_day: date | None
     color: str
     team: str | None
+    people: list[PersonOut] = []
     created_by: str
 
 
@@ -352,7 +355,7 @@ def event_out(e) -> EventOut:
     all_day, sd, ed = _days(e.start, e.end)
     return EventOut(id=e.id, title=e.title, description=e.description, start=e.start, end=e.end, all_day=all_day,
                     start_day=sd, end_day=ed, color=e.color, team=e.team.slug if e.team else None,
-                    created_by=e.created_by)
+                    people=[PersonOut.model_validate(p) for p in e.people], created_by=e.created_by)
 
 
 class CalendarOut(BaseModel):

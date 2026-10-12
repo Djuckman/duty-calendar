@@ -32,18 +32,20 @@ def test_absence_dry_run_then_apply(team, admin, notifier):
     assert r.status_code == 200, r.text
     plan = r.json()["plans"][0]
     assert r.json()["absence"] is None
-    assert [(c["old"]["name"], c["new"]["name"], c["reason"]) for c in plan["changes"]] == [("Боря", "Вика", "absent")]
+    assert (plan["changes"][0]["old"]["name"], plan["changes"][0]["new"]["name"], plan["changes"][0]["reason"]) \
+        == ("Боря", "Вика", "absent")
     assert names(get_shifts(admin))[1] == ["Боря"]  # dry run ничего не поменял
 
     notifier.messages.clear()
     r = admin.post("/api/v1/absences", json=body)
     assert r.status_code == 200
-    assert names(get_shifts(admin))[1] == ["Вика"]
+    # после отпуска очередь перебалансирована: Боря берёт ближайшую смену после возвращения, без перекоса
+    assert names(get_shifts(admin))[:6] == [["Аня"], ["Вика"], ["Боря"], ["Аня"], ["Вика"], ["Боря"]]
     assert any("@borya → @vika" in m[1] for m in notifier.messages)
 
     absence_id = r.json()["absence"]["id"]
-    r = admin.delete(f"/api/v1/absences/{absence_id}", params={"dry_run": True})
-    assert r.json()["plans"][0]["changes"] == []  # fix-режим не возвращает Борю: смена валидна у Вики
+    r = admin.delete(f"/api/v1/absences/{absence_id}")
+    assert names(get_shifts(admin))[:6] == [["Аня"], ["Боря"], ["Вика"], ["Аня"], ["Боря"], ["Вика"]]
 
 
 def test_manual_assign_pins_and_checks_absence(team, admin):
@@ -259,12 +261,14 @@ def test_delete_grid_shift_leaves_gap_and_restore(team, admin, notifier):
 
 def test_events_crud(team, admin):
     r = admin.post("/api/v1/events", json={"title": "Релиз", "start": "2026-10-20", "end": "2026-10-20",
-                                           "team": "sec", "color": "#8a3ffc"})
+                                           "team": "sec", "color": "#8a3ffc", "emails": ["a@x.ru", "c@x.ru"]})
     assert r.status_code == 201, r.text
     ev = r.json()
+    assert [p["name"] for p in ev["people"]] == ["Аня", "Вика"]
     assert ev["all_day"] and ev["start_day"] == ev["end_day"] == "2026-10-20"
-    r = admin.patch(f"/api/v1/events/{ev['id']}", json={"end": "2026-10-21", "title": "Релиз 2.0"})
+    r = admin.patch(f"/api/v1/events/{ev['id']}", json={"end": "2026-10-21", "title": "Релиз 2.0", "emails": ["b@x.ru"]})
     assert r.json()["end_day"] == "2026-10-21" and r.json()["title"] == "Релиз 2.0"
+    assert [p["name"] for p in r.json()["people"]] == ["Боря"]
     cal = admin.get("/api/v1/calendar", params={"start": "2026-10-01T00:00:00Z", "end": "2026-10-31T00:00:00Z"}).json()
     assert [e["title"] for e in cal["events"]] == ["Релиз 2.0"]
     assert admin.post("/api/v1/events", json={"title": "x", "start": "2026-10-21", "end": "2026-10-20"}).status_code == 422

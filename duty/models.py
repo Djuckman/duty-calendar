@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import UTC, date, datetime
 
-from sqlalchemy import Boolean, Date, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy import Boolean, Column, Date, ForeignKey, Integer, String, Table, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .db import Base, UTCDateTime
@@ -157,6 +157,14 @@ class ShiftLog(Base):
     actor: Mapped[str] = mapped_column(String(100), default="planner")
 
 
+event_people = Table(
+    "event_people",
+    Base.metadata,
+    Column("event_id", ForeignKey("events.id", ondelete="CASCADE"), primary_key=True),
+    Column("person_id", ForeignKey("people.id", ondelete="CASCADE"), primary_key=True),
+)
+
+
 class CalendarEvent(Base):
     """Произвольное событие в календаре (не дежурство): релиз, учения, встреча и т.п."""
 
@@ -173,6 +181,7 @@ class CalendarEvent(Base):
     created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
 
     team: Mapped[Team | None] = relationship()
+    people: Mapped[list[Person]] = relationship(secondary=event_people, order_by="Person.name")
 
 
 class Holiday(Base):

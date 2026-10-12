@@ -56,6 +56,9 @@ from .planning.slots import RotationRule, generate_slots
 log = logging.getLogger(__name__)
 
 HISTORY_DAYS = 180
+# После изменения отсутствий — перебалансировка без заморозки (закреплённые и начавшиеся смены не трогаются),
+# чтобы очередь оставалась ровной, а не только «чинилась» сломанная смена.
+AFTER_ABSENCE = ("rebalance", True, 0)  # mode, notify, freeze_days
 SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{1,62}$")
 ABSENCE_KINDS = ("vacation", "sick", "dayoff", "other")
 HOLIDAY_KINDS = ("holiday", "dayoff", "workday", "short")
@@ -943,14 +946,14 @@ class DutyService:
             extra = {person.id: [Interval(st, en)]}
             reports = []
             for t in teams:
-                result, _ = self._compute(s, t, "fix", extra_absences=extra)
-                reports.append(self._report(s, t, result, "fix", True, {}))
+                result, _ = self._compute(s, t, AFTER_ABSENCE[0], extra_absences=extra, freeze_days=0)
+                reports.append(self._report(s, t, result, AFTER_ABSENCE[0], True, {}))
             return None, reports
         absence = Absence(person_id=person.id, start=st, end=en, kind=kind, note=note, source="manual",
                           created_by=op.actor_name)
         s.add(absence)
         s.flush()
-        return absence, [self._replan(op, t, "fix") for t in teams]
+        return absence, [self._replan(op, t, *AFTER_ABSENCE) for t in teams]
 
     def update_absence(
         self,
@@ -978,9 +981,10 @@ class DutyService:
         if dry_run:
             reports = []
             for t in teams:
-                result, _ = self._compute(s, t, "fix", extra_absences={absence.person_id: [Interval(st, en)]},
+                result, _ = self._compute(s, t, AFTER_ABSENCE[0], extra_absences={absence.person_id: [Interval(st, en)]},
+                                          freeze_days=0,
                                           skip_absence_ids={absence_id})
-                reports.append(self._report(s, t, result, "fix", True, {}))
+                reports.append(self._report(s, t, result, AFTER_ABSENCE[0], True, {}))
             return absence, reports
         absence.start, absence.end = st, en
         if kind is not None:
@@ -988,7 +992,7 @@ class DutyService:
         if note is not None:
             absence.note = note
         s.flush()
-        return absence, [self._replan(op, t, "fix") for t in teams]
+        return absence, [self._replan(op, t, *AFTER_ABSENCE) for t in teams]
 
     # ------------------------------------------------------------ ручные дежурства (слои поверх графика)
 
@@ -1145,7 +1149,7 @@ class DutyService:
     # ------------------------------------------------------------ события (не дежурства)
 
     def list_events(self, s: Session, start: datetime, end: datetime, team_slugs: list[str] | None = None):
-        q = (select(CalendarEvent).options(selectinload(CalendarEvent.team))
+        q = (select(CalendarEvent).options(selectinload(CalendarEvent.team), selectinload(CalendarEvent.people))
              .where(CalendarEvent.start < end, CalendarEvent.end > start).order_by(CalendarEvent.start))
         events = list(s.scalars(q))
         if team_slugs:
@@ -1165,6 +1169,11 @@ class DutyService:
             if not re.fullmatch(r"#[0-9a-fA-F]{6}", data["color"]):
                 raise Invalid("color: #RRGGBB")
             ev.color = data["color"]
+        if data.get("emails") is not None:
+            people = []
+            for e in dict.fromkeys(norm_email(x) for x in data["emails"] if x and x.strip()):
+                people.append(self.get_person(s, e))
+            ev.people = people
         if data.get("start") is not None:
             ev.start = self.parse_moment(data["start"])
         if data.get("end") is not None:
@@ -1202,12 +1211,12 @@ class DutyService:
         if dry_run:
             reports = []
             for t in teams:
-                result, _ = self._compute(s, t, "fix", skip_absence_ids={absence_id})
-                reports.append(self._report(s, t, result, "fix", True, {}))
+                result, _ = self._compute(s, t, AFTER_ABSENCE[0], skip_absence_ids={absence_id}, freeze_days=0)
+                reports.append(self._report(s, t, result, AFTER_ABSENCE[0], True, {}))
             return reports
         s.delete(absence)
         s.flush()
-        return [self._replan(op, t, "fix") for t in teams]
+        return [self._replan(op, t, *AFTER_ABSENCE) for t in teams]
 
     def sync_external_absences(self, op: Op) -> int:
         """Забрать отсутствия из внешних источников и заменить ими прежние записи этих источников."""

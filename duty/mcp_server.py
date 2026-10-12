@@ -236,24 +236,26 @@ def build_mcp(svc: DutyService, resolve_user: Callable[[], User | None] = _heade
 
     @mcp.tool
     def add_event(title: str, start: str, end: str, description: str = "", team: str | None = None,
-                  color: str = "#e5a50a") -> dict:
-        """Добавить событие (не дежурство). Даты 'YYYY-MM-DD' (конец включительно) или ISO 8601 с временем."""
+                  color: str = "#e5a50a", emails: list[str] | None = None) -> dict:
+        """Добавить событие (не дежурство) с участниками (emails). Даты 'YYYY-MM-DD' (конец включительно)
+        или ISO 8601 с временем."""
         u = user()
 
         def run():
             with svc.write(u) as op:
                 return _dump(S.event_out(svc.create_event(op, dict(title=title, start=start, end=end,
-                                                                  description=description, team=team, color=color))))
+                                                                  description=description, team=team, color=color,
+                                                                  emails=emails or []))))
 
         return call(run)
 
     @mcp.tool
     def update_event(event_id: int, title: str | None = None, start: str | None = None, end: str | None = None,
-                     description: str | None = None, color: str | None = None) -> dict:
-        """Изменить событие."""
+                     description: str | None = None, color: str | None = None, emails: list[str] | None = None) -> dict:
+        """Изменить событие (emails — новый список участников)."""
         u = user()
-        data = {k: v for k, v in dict(title=title, start=start, end=end, description=description, color=color).items()
-                if v is not None}
+        data = {k: v for k, v in dict(title=title, start=start, end=end, description=description, color=color,
+                                      emails=emails).items() if v is not None}
 
         def run():
             with svc.write(u) as op:

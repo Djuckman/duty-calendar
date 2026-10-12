@@ -93,6 +93,45 @@ function openDialog(title, contentHtml, buttons = []) {
 }
 const closeDialog = () => $("#dlg").close();
 
+/** Своё окно подтверждения (вместо системного окна браузера). */
+function askConfirm(message, okText = "Да", danger = false) {
+  return new Promise((resolve) => {
+    const d = $("#dlg-confirm");
+    d.querySelector(".msg").textContent = message;
+    const ok = d.querySelector(".ok");
+    ok.textContent = okText;
+    ok.className = "btn ok " + (danger ? "danger-fill" : "primary");
+    const done = (v) => { if (d.open) d.close(); resolve(v); };
+    ok.onclick = () => done(true);
+    d.querySelector(".cancel").onclick = () => done(false);
+    d.oncancel = (e) => { e.preventDefault(); done(false); };
+    d.showModal();
+    ok.focus();
+  });
+}
+
+/** Дата «по» не раньше даты «с»; при сдвиге «с» сохраняем длительность. */
+function linkDates(startEl, endEl) {
+  if (!startEl || !endEl) return;
+  const parse = (v) => (v ? new Date(v.length === 10 ? v + "T00:00:00" : v) : null);
+  const fmtLike = (d, v) => (v.length === 10 ? isoDate(d) : dtLocal(d.toISOString()));
+  let prev = startEl.value;
+  const sync = () => {
+    endEl.min = startEl.value;
+    const s = parse(startEl.value), e = parse(endEl.value), p = parse(prev);
+    if (s && e && p) {
+      const kept = new Date(e.getTime() + (s - p));
+      endEl.value = fmtLike(kept < s ? s : kept, endEl.value);
+    } else if (s && !e) {
+      endEl.value = startEl.value;
+    }
+    prev = startEl.value;
+  };
+  endEl.min = startEl.value;
+  startEl.addEventListener("change", sync);
+  endEl.addEventListener("change", () => { if (endEl.value && endEl.value < startEl.value) endEl.value = startEl.value; });
+}
+
 /* ---------------------------------------------------------------- вход */
 
 function showLogin() {
@@ -240,7 +279,8 @@ function toEvents(data) {
   }
   for (const ev of data.events || []) {
     events.push({
-      id: "e" + ev.id, title: "★ " + ev.title, allDay: ev.all_day,
+      id: "e" + ev.id, title: "★ " + ev.title + (ev.people?.length ? " · " + ev.people.map((p) => p.name).join(", ") : ""),
+      allDay: ev.all_day,
       start: ev.all_day ? ev.start_day : ev.start, end: ev.all_day ? addDays(ev.end_day, 1) : ev.end,
       backgroundColor: ev.color, borderColor: ev.color, classNames: ["ev-custom"], display: "block",
       extendedProps: { type: "event", event: ev },
@@ -329,7 +369,7 @@ async function assignWithForce(shiftId, email, seat) {
   try {
     return await api("POST", `/shifts/${shiftId}/assign`, { email, seat, force: false });
   } catch (e) {
-    if (e.status === 409 && /force/.test(e.message) && confirm(e.message.replace(/Чтобы.*|Повторите.*/, "") + "\n\nНазначить всё равно?")) {
+    if (e.status === 409 && /force/.test(e.message) && await askConfirm(e.message.replace(/Чтобы.*|Повторите.*/, "") + "\n\nНазначить всё равно?", "Назначить")) {
       return api("POST", `/shifts/${shiftId}/assign`, { email, seat, force: true });
     }
     throw e;
@@ -407,13 +447,14 @@ async function openShift(shiftId) {
     }));
   });
 
+  linkDates($("#sh-start"), $("#sh-end"));
   const saveDates = body.querySelector("#sh-save-dates");
   if (saveDates) saveDates.onclick = () => guard(async () => {
     const payload = { start: new Date($("#sh-start").value).toISOString(), end: new Date($("#sh-end").value).toISOString() };
     try {
       await api("PATCH", `/shifts/${sh.id}`, { ...payload, force: false });
     } catch (e) {
-      if (e.status === 409 && /force/.test(e.message) && confirm(e.message.replace(/Чтобы.*/, "") + "\n\nСохранить всё равно?")) {
+      if (e.status === 409 && /force/.test(e.message) && await askConfirm(e.message.replace(/Чтобы.*/, "") + "\n\nСохранить всё равно?", "Сохранить")) {
         await api("PATCH", `/shifts/${sh.id}`, { ...payload, force: true });
       } else throw e;
     }
@@ -437,7 +478,7 @@ async function openShift(shiftId) {
   if (delBtn) delBtn.onclick = () => guard(async () => {
     const msg = sh.manual ? "Удалить ручное дежурство?"
       : "Удалить дежурство? Эти дни останутся без дежурного — планировщик их не заполнит. Вернуть можно, кликнув по снятой смене.";
-    if (!confirm(msg)) return;
+    if (!(await askConfirm(msg, "Удалить", true))) return;
     await api("DELETE", `/shifts/${sh.id}`);
     toast("Дежурство удалено");
     closeDialog();
@@ -474,7 +515,7 @@ async function finishSwap(target, clickedSeat) {
     try {
       await api("POST", "/shifts/swap", { shift_a: src.shift.id, seat_a: src.seat, shift_b: target.id, seat_b: seatB, force });
     } catch (e) {
-      if (e.status === 409 && /force/.test(e.message) && confirm(e.message + "\n\nПоменять всё равно?")) return doSwap(seatB, true);
+      if (e.status === 409 && /force/.test(e.message) && await askConfirm(e.message + "\n\nПоменять всё равно?", "Поменять")) return doSwap(seatB, true);
       throw e;
     }
     cancelSwap();
@@ -532,6 +573,7 @@ function openAddAbsence() {
   if (!state.people.length) return toast("Сначала добавьте людей в команды", true);
   const payload = () => ({ email: $("#ab-person").value, start: $("#ab-start").value, end: $("#ab-end").value,
                            kind: $("#ab-kind").value, note: $("#ab-note").value });
+  setTimeout(() => linkDates($("#ab-start"), $("#ab-end")));
   openDialog("Новое отсутствие", absenceForm(), [
     { text: "Что изменится?", onClick: () => guard(async () => {
       const r = await api("POST", "/absences", payload(), { dry_run: true });
@@ -555,6 +597,7 @@ function openAbsence(a) {
     refresh();
     openDialog(title, renderReports(r.plans), [{ text: "OK", cls: "primary", onClick: closeDialog }]);
   };
+  setTimeout(() => linkDates($("#ab-start"), $("#ab-end")));
   openDialog(`Отсутствие: ${a.person.name}`, `
     ${editable ? `
       <div class="grid2">
@@ -569,7 +612,7 @@ function openAbsence(a) {
     <div class="muted">Источник: ${esc(a.source)}${a.created_by ? `, добавил ${esc(a.created_by)}` : ""}</div>
     <div id="ab-preview"></div>`, editable ? [
     { text: "Удалить", cls: "danger", onClick: () => guard(async () => {
-      if (!confirm("Удалить отсутствие?")) return;
+      if (!(await askConfirm("Удалить отсутствие?", "Удалить", true))) return;
       done("Отсутствие удалено", await api("DELETE", `/absences/${a.id}`));
     }) },
     { text: "Что изменится?", onClick: () => guard(async () => {
@@ -599,12 +642,34 @@ function eventFields(ev, startDate, days) {
         ${teams.map((t) => `<option value="${esc(t.slug)}" ${ev?.team === t.slug ? "selected" : ""}>${esc(t.name)}</option>`).join("")}</select></label>
       <label>Цвет<input type="color" id="ev-color" value="${esc(ev?.color || "#e5a50a")}"></label>
     </div>
+    <div><span class="muted">Участники:</span><div id="ev-people" class="people-pick"></div></div>
     <label>Описание<textarea id="ev-desc" rows="3">${esc(ev?.description || "")}</textarea></label>`;
+}
+
+/** Чекбоксы участников события: люди выбранной команды (или все); отмеченные сохраняются при смене команды. */
+function bindEventPeople(ev) {
+  const box = $("#ev-people");
+  const checked = new Set((ev?.people || []).map((p) => p.email));
+  const render = () => {
+    box.querySelectorAll("input:checked").forEach((c) => checked.add(c.value));
+    box.querySelectorAll("input:not(:checked)").forEach((c) => checked.delete(c.value));
+    const team = teamBySlug($("#ev-team").value);
+    const emails = team ? team.members.map((m) => m.email) : state.people.map((p) => p.email);
+    const people = state.people.filter((p) => emails.includes(p.email) || checked.has(p.email))
+      .sort((a, b) => a.name.localeCompare(b.name, "ru"));
+    box.innerHTML = people.map((p) => `<label class="inline"><input type="checkbox" class="ev-p" value="${esc(p.email)}" ${checked.has(p.email) ? "checked" : ""}>
+      <span><span class="team-dot" style="background:${personColor(p.id)}"></span>${esc(p.name)}</span></label>`).join("")
+      || `<p class="muted">Людей пока нет.</p>`;
+  };
+  $("#ev-team").addEventListener("change", render);
+  render();
+  linkDates($("#ev-start"), $("#ev-end"));
 }
 
 const eventPayload = () => ({
   title: $("#ev-title").value, start: $("#ev-start").value, end: $("#ev-end").value,
   team: $("#ev-team").value || null, color: $("#ev-color").value, description: $("#ev-desc").value,
+  emails: [...document.querySelectorAll(".ev-p:checked")].map((c) => c.value),
 });
 
 function openCreate(startDate, days, teamSlug, kind = "duty") {
@@ -624,6 +689,7 @@ function openCreate(startDate, days, teamSlug, kind = "duty") {
       }) },
     ]);
     body.querySelectorAll("[name=cr-kind]").forEach((r) => r.onchange = () => openCreate(startDate, days, teamSlug, r.value));
+    bindEventPeople(null);
     return;
   }
 
@@ -644,7 +710,7 @@ function openCreate(startDate, days, teamSlug, kind = "duty") {
       try {
         await api("POST", `/teams/${team.slug}/shifts`, payload);
       } catch (e) {
-        if (e.status === 409 && /force/.test(e.message) && confirm(e.message.replace(/Чтобы.*/, "") + "\n\nДобавить всё равно?")) {
+        if (e.status === 409 && /force/.test(e.message) && await askConfirm(e.message.replace(/Чтобы.*/, "") + "\n\nДобавить всё равно?", "Добавить")) {
           await api("POST", `/teams/${team.slug}/shifts`, { ...payload, force: true });
         } else throw e;
       }
@@ -673,9 +739,10 @@ function openCreate(startDate, days, teamSlug, kind = "duty") {
 const openManualShift = (d, n, t) => openCreate(d, n, t, "duty");
 
 function openEvent(ev) {
+  setTimeout(() => bindEventPeople(ev));
   openDialog("Событие", eventFields(ev) + `<p class="muted">Добавил: ${esc(ev.created_by || "—")}</p>`, [
     { text: "Удалить", cls: "danger", onClick: () => guard(async () => {
-      if (!confirm("Удалить событие?")) return;
+      if (!(await askConfirm("Удалить событие?", "Удалить", true))) return;
       await api("DELETE", `/events/${ev.id}`);
       closeDialog();
       refresh();
@@ -856,7 +923,7 @@ async function openTeamEditor(slug) {
       <div class="grid2"><label>Email<input id="mb-email"></label><label>Имя<input id="mb-name"></label>
         <label>Логин Mattermost<input id="mb-mm"></label><div class="row"><button class="btn" id="mb-add">Добавить участника</button></div></div>` : ""}`, [
     ...(t ? [{ text: "Удалить команду", cls: "danger", onClick: () => guard(async () => {
-      if (!confirm(`Удалить команду «${t.name}» вместе со всеми сменами?`)) return;
+      if (!(await askConfirm(`Удалить команду «${t.name}» вместе со всеми сменами?`, "Удалить", true))) return;
       await api("DELETE", `/teams/${t.slug}`);
       await reloadAll();
       openAdmin();
@@ -879,7 +946,7 @@ async function openTeamEditor(slug) {
       await reloadAll();
     });
     row.querySelector(".mb-del").onclick = () => guard(async () => {
-      if (!confirm(`Убрать ${email} из команды?`)) return;
+      if (!(await askConfirm(`Убрать ${email} из команды?`, "Убрать", true))) return;
       await api("DELETE", `/teams/${t.slug}/members/${enc}`);
       await reloadAll();
       openTeamEditor(t.slug);

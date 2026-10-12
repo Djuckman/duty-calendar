@@ -98,14 +98,19 @@ class Shift(Base):
     """Смена дежурства (интервал [start, end)). Дежурные — в ShiftAssignment, по одному на место (seat)."""
 
     __tablename__ = "shifts"
-    __table_args__ = (UniqueConstraint("team_id", "start"),)
+    # Смены сетки уникальны по (team_id, start) среди manual=False — это обеспечивает код;
+    # ручные дежурства — слои поверх сетки, их может быть сколько угодно в одно время.
 
     id: Mapped[int] = mapped_column(primary_key=True)
     team_id: Mapped[int] = mapped_column(ForeignKey("teams.id", ondelete="CASCADE"), index=True)
     start: Mapped[datetime] = mapped_column(UTCDateTime, index=True)
     end: Mapped[datetime] = mapped_column(UTCDateTime)
     deleted: Mapped[bool] = mapped_column(Boolean, default=False)  # удалена, ждёт снятия из внешнего календаря
-    manual: Mapped[bool] = mapped_column(Boolean, default=False)  # период задан вручную, а не сеткой ротации
+    manual: Mapped[bool] = mapped_column(Boolean, default=False)  # ручное дежурство (слой поверх графика ротации)
+    # Для смен по графику: начало слота сетки (идентичность смены в ротации) и признак, что даты изменены вручную.
+    slot_start: Mapped[datetime | None] = mapped_column(UTCDateTime, nullable=True, index=True)
+    custom_period: Mapped[bool] = mapped_column(Boolean, default=False)
+    cancelled: Mapped[bool] = mapped_column(Boolean, default=False)  # смена по графику снята вручную: дни без дежурства
 
     # Публикация во внешний календарь (Exchange и т.п.): одно событие на смену, все дежурные — участники
     external_id: Mapped[str | None] = mapped_column(String(512), nullable=True)
@@ -150,6 +155,24 @@ class ShiftLog(Base):
     new_person_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     reason: Mapped[str] = mapped_column(String(50))
     actor: Mapped[str] = mapped_column(String(100), default="planner")
+
+
+class CalendarEvent(Base):
+    """Произвольное событие в календаре (не дежурство): релиз, учения, встреча и т.п."""
+
+    __tablename__ = "events"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    team_id: Mapped[int | None] = mapped_column(ForeignKey("teams.id", ondelete="CASCADE"), nullable=True, index=True)
+    title: Mapped[str] = mapped_column(String(300))
+    description: Mapped[str] = mapped_column(Text, default="")
+    start: Mapped[datetime] = mapped_column(UTCDateTime, index=True)
+    end: Mapped[datetime] = mapped_column(UTCDateTime)
+    color: Mapped[str] = mapped_column(String(20), default="#e5a50a")
+    created_by: Mapped[str] = mapped_column(String(100), default="")
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
+
+    team: Mapped[Team | None] = relationship()
 
 
 class Holiday(Base):

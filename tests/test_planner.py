@@ -265,15 +265,3 @@ def test_group_continuation_keeps_same_person():
     res = plan(NOW, slots)
     assert who(res) == [A, B, C, C, A, B]
 
-
-def test_manual_shift_cuts_grid_and_keeps_rest():
-    rule = weekly_rule(shift_length_days=2, weekdays="12345", anchor_date=date(2026, 10, 12))
-    slots = generate_slots(rule, utc(2026, 10, 12), utc(2026, 10, 17))
-    first = plan(NOW, slots)
-    existing = as_existing(first)  # пн-вт A, ср-чт B, пт C
-    # вручную: четверг целиком за A
-    manual = ExistingShift(99, utc(2026, 10, 15, 7), utc(2026, 10, 16, 7), (ExistingSeat(0, A, True),), manual=True)
-    res = plan(NOW, slots, existing=existing + [manual])
-    got = [(s.start.day, s.end.day, s.people) for s in res.shifts]
-    assert got == [(12, 14, [A]), (14, 15, [B]), (15, 16, [A]), (16, 17, [C])]
-    assert res.deletions == []  # смена ср-чт осталась (тот же start), только укоротилась

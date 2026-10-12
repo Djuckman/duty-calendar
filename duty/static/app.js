@@ -12,7 +12,8 @@ const REASONS = {
   rebalance: "перебалансировка", removed: "смена удалена", manual: "вручную", swap: "обмен", unassigned: "некому дежурить",
 };
 
-const state = { me: null, teams: [], people: [], selected: new Set(), calendar: null, data: null, swap: null };
+const state = { me: null, teams: [], people: [], selected: new Set(), calendar: null, data: null, swap: null,
+                colorMode: "person" };
 
 /* ---------------------------------------------------------------- утилиты */
 
@@ -130,6 +131,12 @@ function personColor(id) {
   return PERSON_COLORS[(i < 0 ? id : i) % PERSON_COLORS.length];
 }
 const personById = (id) => state.people.find((p) => p.id === id);
+const dutyColor = (sh, person) => (state.colorMode === "person" ? (person ? personColor(person.id) : "#c4314b") : teamColor(sh.team));
+const dtLocal = (iso) => {
+  const d = new Date(iso);
+  return `${isoDate(d)}T${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+};
+const addDays = (iso, n) => { const d = new Date(iso + "T00:00:00"); d.setDate(d.getDate() + n); return isoDate(d); };
 
 async function loadReference() {
   [state.teams, state.people] = await Promise.all([api("GET", "/teams"), api("GET", "/people")]);
@@ -137,10 +144,24 @@ async function loadReference() {
   state.selected = new Set((saved || state.teams.map((t) => t.slug)).filter((s) => teamBySlug(s)));
   if (!state.selected.size) state.teams.forEach((t) => state.selected.add(t.slug));
   renderTeamFilter();
+  renderColorMode();
   renderPeopleLegend();
 }
 
+function renderColorMode() {
+  state.colorMode = load("duty.colorMode", "person");
+  $("#color-mode").innerHTML = [["person", "по людям"], ["team", "по командам"]].map(([v, t]) =>
+    `<label class="inline"><input type="radio" name="color-mode" value="${v}" ${state.colorMode === v ? "checked" : ""}> ${t}</label>`).join("");
+  $("#color-mode").querySelectorAll("input").forEach((r) => r.onchange = () => {
+    state.colorMode = r.value;
+    store("duty.colorMode", r.value);
+    renderPeopleLegend();
+    state.calendar?.refetchEvents();
+  });
+}
+
 function renderPeopleLegend() {
+  $("#people-block").hidden = state.colorMode !== "person";
   const emails = new Set();
   state.teams.filter((t) => state.selected.has(t.slug)).forEach((t) => t.members.forEach((m) => emails.add(m.email)));
   const people = state.people.filter((p) => emails.has(p.email)).sort((a, b) => a.name.localeCompare(b.name, "ru"));
@@ -200,7 +221,7 @@ function toEvents(data) {
       if (sh.manual) cls.push("ev-manual");
       if (!p || absencesOf(p.id, sh.start, sh.end).length) cls.push("ev-problem");
       if (state.swap && state.swap.shift.id === sh.id && state.swap.seat === i) cls.push("ev-selecting");
-      const color = p ? personColor(p.id) : "#c4314b";
+      const color = !p && state.colorMode === "person" ? "#c4314b" : dutyColor(sh, p);
       const prefix = state.selected.size > 1 ? sh.team_name + ": " : "";
       events.push({
         id: `s${sh.id}-${i}`, title: prefix + (p ? p.name : "свободно") + (seat.pinned ? " 📌" : ""),
@@ -215,6 +236,21 @@ function toEvents(data) {
       id: "a" + a.id, title: `🏖 ${a.person.name} · ${KINDS[a.kind] || a.kind}`,
       start: a.all_day ? a.start_day : a.start, end: endExcl, allDay: a.all_day,
       classNames: ["ev-absence"], display: "block", extendedProps: { type: "absence", absence: a },
+    });
+  }
+  for (const ev of data.events || []) {
+    events.push({
+      id: "e" + ev.id, title: "★ " + ev.title, allDay: ev.all_day,
+      start: ev.all_day ? ev.start_day : ev.start, end: ev.all_day ? addDays(ev.end_day, 1) : ev.end,
+      backgroundColor: ev.color, borderColor: ev.color, classNames: ["ev-custom"], display: "block",
+      extendedProps: { type: "event", event: ev },
+    });
+  }
+  for (const sh of data.cancelled || []) {
+    events.push({
+      id: "c" + sh.id, title: `снято: ${sh.seats.map((x) => x.person?.name).filter(Boolean).join(", ") || "дежурство"}`,
+      start: sh.start, end: sh.end, classNames: ["ev-cancelled"], display: "block",
+      extendedProps: { type: "cancelled", shift: sh },
     });
   }
   for (const h of data.holidays) {
@@ -244,7 +280,7 @@ function initCalendar() {
     select: (info) => {
       state.calendar.unselect();
       const days = info.allDay ? Math.max(1, Math.round((info.end - info.start) / 86400000)) : 1;
-      openManualShift(isoDate(info.start), days);
+      openCreate(isoDate(info.start), days);
     },
     datesSet: (info) => store("duty.view", info.view.type),
     events: async (info, success, failure) => {
@@ -260,6 +296,8 @@ function initCalendar() {
       const p = info.event.extendedProps;
       if (p.type === "shift") (state.swap ? finishSwap(p.shift, p.seat) : openShift(p.shift.id));
       else if (p.type === "absence") openAbsence(p.absence);
+      else if (p.type === "event") openEvent(p.event);
+      else if (p.type === "cancelled") openCancelled(p.shift);
     },
   });
   state.calendar.render();
@@ -322,16 +360,23 @@ async function openShift(shiftId) {
       </div>`);
   }
   const problems = shiftProblems(sh);
-  const body = openDialog(`${sh.team_name}: ${sh.manual ? "ручное дежурство" : "смена"}`, `
-    <div><b>${esc(range(sh.start, sh.end))}</b></div>
-    ${sh.manual ? `<p class="muted">✋ Период задан вручную — он вырезан из графика ротации. Если удалить, дни вернутся в график.</p>` : ""}
+  const body = openDialog(`${sh.team_name}: ${sh.manual ? "ручное дежурство" : "дежурство по графику"}`, `
+    ${sh.manual ? `<p class="muted">✋ Ручное дежурство — отдельный слой поверх графика ротации.</p>` : ""}
+    ${sh.custom_period ? `<p class="muted">Даты этой смены изменены вручную (по графику начиналась ${esc(fmt.format(new Date(sh.slot_start)))}). Остальной график не сдвигается.</p>` : ""}
     ${past ? `<p class="muted">Смена уже прошла — только просмотр.</p>` : ""}
+    <div class="grid2">
+      <label>Начало<input type="datetime-local" id="sh-start" value="${dtLocal(sh.start)}" ${past ? "disabled" : ""}></label>
+      <label>Конец<input type="datetime-local" id="sh-end" value="${dtLocal(sh.end)}" ${past ? "disabled" : ""}></label>
+    </div>
+    ${past ? "" : `<div class="row" style="flex-wrap:wrap">
+      <button class="btn" id="sh-save-dates" style="flex:0">Сохранить даты</button>
+      ${sh.custom_period ? `<button class="btn ghost" id="sh-reset-dates" style="flex:0">Вернуть даты графика</button>` : ""}</div>`}
     ${problems.length ? `<ul class="changes">${problems.map((p) => `<li class="warn">⚠️ ${esc(p)}</li>`).join("")}</ul>` : ""}
     ${seats.join("")}
     ${past ? "" : `<div class="row" style="flex-wrap:wrap">
-       <button class="btn ghost" id="add-seat" style="flex:0">+ добавить дежурного сверх нормы</button>
-       <button class="btn ghost" id="part-manual" style="flex:0">Назначить на часть дней…</button>
-       ${sh.manual ? `<button class="btn danger" id="del-manual" style="flex:0">Удалить ручное дежурство</button>` : ""}</div>`}
+       <button class="btn ghost" id="add-seat" style="flex:0">+ добавить дежурного</button>
+       <button class="btn ghost" id="add-overlay" style="flex:0">+ дежурство поверх…</button>
+       <button class="btn danger" id="del-shift" style="flex:0">Удалить дежурство</button></div>`}
     <details><summary class="muted">История изменений</summary><div class="log" id="shift-log">загрузка…</div></details>
   `);
 
@@ -362,17 +407,41 @@ async function openShift(shiftId) {
     }));
   });
 
-  const partBtn = body.querySelector("#part-manual");
-  if (partBtn) partBtn.onclick = () => {
-    const from = new Date(Math.max(new Date(sh.start), Date.now()));
-    openManualShift(isoDate(from), 1, sh.team);
-  };
-  const delBtn = body.querySelector("#del-manual");
-  if (delBtn) delBtn.onclick = () => guard(async () => {
-    if (!confirm("Удалить ручное дежурство? Эти дни вернутся в график ротации.")) return;
-    const r = await api("DELETE", `/shifts/${sh.id}`);
+  const saveDates = body.querySelector("#sh-save-dates");
+  if (saveDates) saveDates.onclick = () => guard(async () => {
+    const payload = { start: new Date($("#sh-start").value).toISOString(), end: new Date($("#sh-end").value).toISOString() };
+    try {
+      await api("PATCH", `/shifts/${sh.id}`, { ...payload, force: false });
+    } catch (e) {
+      if (e.status === 409 && /force/.test(e.message) && confirm(e.message.replace(/Чтобы.*/, "") + "\n\nСохранить всё равно?")) {
+        await api("PATCH", `/shifts/${sh.id}`, { ...payload, force: true });
+      } else throw e;
+    }
+    toast("Даты изменены");
+    closeDialog();
     refresh();
-    openDialog("Ручное дежурство удалено", renderReports([r]), [{ text: "OK", cls: "primary", onClick: closeDialog }]);
+  });
+  const resetDates = body.querySelector("#sh-reset-dates");
+  if (resetDates) resetDates.onclick = () => guard(async () => {
+    await api("POST", `/shifts/${sh.id}/reset-period`);
+    toast("Даты графика восстановлены");
+    closeDialog();
+    refresh();
+  });
+  const overlayBtn = body.querySelector("#add-overlay");
+  if (overlayBtn) overlayBtn.onclick = () => {
+    const from = new Date(Math.max(new Date(sh.start), Date.now()));
+    openCreate(isoDate(from), 1, sh.team);
+  };
+  const delBtn = body.querySelector("#del-shift");
+  if (delBtn) delBtn.onclick = () => guard(async () => {
+    const msg = sh.manual ? "Удалить ручное дежурство?"
+      : "Удалить дежурство? Эти дни останутся без дежурного — планировщик их не заполнит. Вернуть можно, кликнув по снятой смене.";
+    if (!confirm(msg)) return;
+    await api("DELETE", `/shifts/${sh.id}`);
+    toast("Дежурство удалено");
+    closeDialog();
+    refresh();
   });
   const addBtn = body.querySelector("#add-seat");
   if (addBtn) addBtn.onclick = () => {
@@ -513,14 +582,53 @@ function openAbsence(a) {
   ] : []);
 }
 
-/* ---------------------------------------------------------------- ручное дежурство */
+/* ---------------------------------------------------------------- создание по клику на день */
 
-function openManualShift(startDate, days, teamSlug) {
+function eventFields(ev, startDate, days) {
+  const st = ev ? (ev.all_day ? ev.start_day : isoDate(new Date(ev.start))) : startDate;
+  const en = ev ? (ev.all_day ? ev.end_day : isoDate(new Date(ev.end))) : addDays(startDate, days - 1);
+  const teams = state.teams;
+  return `
+    <label>Название<input id="ev-title" maxlength="300" value="${esc(ev?.title || "")}" placeholder="Релиз, учения, встреча…"></label>
+    <div class="grid2">
+      <label>С (включительно)<input type="date" id="ev-start" value="${st}"></label>
+      <label>По (включительно)<input type="date" id="ev-end" value="${en}"></label>
+    </div>
+    <div class="grid2">
+      <label>Команда<select id="ev-team"><option value="">все команды</option>
+        ${teams.map((t) => `<option value="${esc(t.slug)}" ${ev?.team === t.slug ? "selected" : ""}>${esc(t.name)}</option>`).join("")}</select></label>
+      <label>Цвет<input type="color" id="ev-color" value="${esc(ev?.color || "#e5a50a")}"></label>
+    </div>
+    <label>Описание<textarea id="ev-desc" rows="3">${esc(ev?.description || "")}</textarea></label>`;
+}
+
+const eventPayload = () => ({
+  title: $("#ev-title").value, start: $("#ev-start").value, end: $("#ev-end").value,
+  team: $("#ev-team").value || null, color: $("#ev-color").value, description: $("#ev-desc").value,
+});
+
+function openCreate(startDate, days, teamSlug, kind = "duty") {
   const teams = state.teams.filter((t) => state.selected.has(t.slug));
-  if (!teams.length) return toast("Выберите команду слева", true);
   let team = teamBySlug(teamSlug) || teams[0];
-  const addDays = (iso, n) => { const d = new Date(iso + "T00:00:00"); d.setDate(d.getDate() + n); return isoDate(d); };
-  const body = openDialog("Назначить дежурство вручную", `
+  const tabs = `<div class="tabs">
+      <label class="inline"><input type="radio" name="cr-kind" value="duty" ${kind === "duty" ? "checked" : ""}> Дежурство</label>
+      <label class="inline"><input type="radio" name="cr-kind" value="event" ${kind === "event" ? "checked" : ""}> Событие</label></div>`;
+
+  if (kind === "event") {
+    const body = openDialog("Добавить в календарь", tabs + eventFields(null, startDate, days), [
+      { text: "Добавить", cls: "primary", onClick: () => guard(async () => {
+        await api("POST", "/events", eventPayload());
+        toast("Событие добавлено");
+        closeDialog();
+        refresh();
+      }) },
+    ]);
+    body.querySelectorAll("[name=cr-kind]").forEach((r) => r.onchange = () => openCreate(startDate, days, teamSlug, r.value));
+    return;
+  }
+
+  if (!teams.length) return toast("Выберите команду слева", true);
+  const body = openDialog("Добавить в календарь", tabs + `
     <label>Команда<select id="ms-team">${teams.map((t) => `<option value="${esc(t.slug)}" ${t.slug === team.slug ? "selected" : ""}>${esc(t.name)}</option>`).join("")}</select></label>
     <div class="grid2">
       <label>С даты<input type="date" id="ms-date" value="${startDate}"></label>
@@ -528,28 +636,28 @@ function openManualShift(startDate, days, teamSlug) {
     </div>
     <p class="muted" id="ms-range"></p>
     <div><span class="muted">Кто дежурит:</span><div id="ms-people"></div></div>
-    <p class="muted">Период вырезается из графика ротации: соседние смены укорачиваются, люди в них не меняются.</p>`, [
-    { text: "Назначить", cls: "primary", onClick: () => guard(async () => {
+    <p class="muted">Ручное дежурство — отдельный слой поверх графика: график ротации не меняется, слоёв может быть несколько.</p>`, [
+    { text: "Добавить", cls: "primary", onClick: () => guard(async () => {
       const emails = [...body.querySelectorAll(".ms-p:checked")].map((c) => c.value);
       if (!emails.length) return toast("Отметьте хотя бы одного человека", true);
       const payload = { start_date: $("#ms-date").value, days: Number($("#ms-days").value), emails, force: false };
-      let r;
       try {
-        r = await api("POST", `/teams/${team.slug}/shifts`, payload);
+        await api("POST", `/teams/${team.slug}/shifts`, payload);
       } catch (e) {
-        if (e.status === 409 && /force/.test(e.message) && confirm(e.message.replace(/Чтобы.*/, "") + "\n\nНазначить всё равно?")) {
-          r = await api("POST", `/teams/${team.slug}/shifts`, { ...payload, force: true });
+        if (e.status === 409 && /force/.test(e.message) && confirm(e.message.replace(/Чтобы.*/, "") + "\n\nДобавить всё равно?")) {
+          await api("POST", `/teams/${team.slug}/shifts`, { ...payload, force: true });
         } else throw e;
       }
+      toast("Дежурство добавлено");
+      closeDialog();
       refresh();
-      openDialog("Дежурство назначено", `<p>${esc(range(r.shift.start, r.shift.end))}: <b>${esc(r.shift.seats.map((x) => x.person?.name).join(", "))}</b></p>` +
-        renderReports([r.plan]), [{ text: "OK", cls: "primary", onClick: closeDialog }]);
     }) },
   ]);
+  body.querySelectorAll("[name=cr-kind]").forEach((r) => r.onchange = () => openCreate(startDate, days, teamSlug, r.value));
   const render = () => {
     team = teamBySlug($("#ms-team").value);
     const d = $("#ms-date").value, n = Math.max(1, Number($("#ms-days").value) || 1);
-    $("#ms-range").textContent = d ? `Смена: ${fmtDay.format(new Date(d + "T00:00:00"))} ${team.handoff_time} — ${fmtDay.format(new Date(addDays(d, n) + "T00:00:00"))} ${team.handoff_time} (время команды, ${team.timezone})` : "";
+    $("#ms-range").textContent = d ? `Дежурство: ${fmtDay.format(new Date(d + "T00:00:00"))} ${team.handoff_time} — ${fmtDay.format(new Date(addDays(d, n) + "T00:00:00"))} ${team.handoff_time} (время команды, ${team.timezone})` : "";
     const checked = new Set([...body.querySelectorAll(".ms-p:checked")].map((c) => c.value));
     const st = d ? new Date(d + "T00:00:00") : new Date(), en = d ? new Date(addDays(d, n) + "T00:00:00") : new Date();
     $("#ms-people").innerHTML = team.members.map((m) => {
@@ -561,6 +669,38 @@ function openManualShift(startDate, days, teamSlug) {
   };
   ["#ms-team", "#ms-date", "#ms-days"].forEach((id) => $(id).addEventListener("input", render));
   render();
+}
+const openManualShift = (d, n, t) => openCreate(d, n, t, "duty");
+
+function openEvent(ev) {
+  openDialog("Событие", eventFields(ev) + `<p class="muted">Добавил: ${esc(ev.created_by || "—")}</p>`, [
+    { text: "Удалить", cls: "danger", onClick: () => guard(async () => {
+      if (!confirm("Удалить событие?")) return;
+      await api("DELETE", `/events/${ev.id}`);
+      closeDialog();
+      refresh();
+    }) },
+    { text: "Сохранить", cls: "primary", onClick: () => guard(async () => {
+      await api("PATCH", `/events/${ev.id}`, eventPayload());
+      toast("Событие сохранено");
+      closeDialog();
+      refresh();
+    }) },
+  ]);
+}
+
+function openCancelled(sh) {
+  const who = sh.seats.map((x) => x.person?.name).filter(Boolean).join(", ") || "—";
+  openDialog(`${sh.team_name}: снятое дежурство`, `
+    <div><b>${esc(range(sh.start, sh.end))}</b></div>
+    <p class="muted">Смена по графику была удалена вручную — эти дни без дежурного. Было: ${esc(who)}.</p>`, [
+    { text: "Вернуть смену", cls: "primary", onClick: () => guard(async () => {
+      await api("POST", `/shifts/${sh.id}/restore`);
+      toast("Смена возвращена, дежурного назначил планировщик");
+      closeDialog();
+      refresh();
+    }) },
+  ]);
 }
 
 /* ---------------------------------------------------------------- перепланирование */

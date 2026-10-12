@@ -89,6 +89,8 @@ label.inline input { width: auto; }
 .sw-absence { background: transparent; border: 1px dashed var(--absence); }
 .sw-holiday { background: var(--holiday); }
 .sw-manual { background: var(--accent) repeating-linear-gradient(135deg, rgba(255,255,255,.35) 0 3px, transparent 3px 6px); }
+.sw-custom { background: #e5a50a; border-radius: 6px; }
+.sw-cancelled { background: transparent; border: 1px dashed var(--muted); }
 .people-legend .person { display: flex; align-items: center; gap: 4px; margin-bottom: 4px; }
 .fc .fc-highlight { background: var(--accent-weak); }
 .sw-weekend { background: var(--weekend); border: 1px solid var(--line); }
@@ -119,6 +121,10 @@ label.inline input { width: auto; }
 .fc-event { cursor: pointer; }
 .fc-event.ev-pinned { box-shadow: inset 3px 0 0 #f2b705; }
 .fc-event.ev-manual { background-image: repeating-linear-gradient(135deg, rgba(255,255,255,.18) 0 6px, transparent 6px 12px); }
+.fc-event.ev-custom { border-radius: 10px; font-style: italic; }
+.fc-event.ev-cancelled { background: transparent !important; border: 1px dashed var(--muted) !important; opacity: .7; }
+.fc-event.ev-cancelled .fc-event-title, .fc-event.ev-cancelled .fc-event-main, .fc-event.ev-cancelled .fc-event-time { color: var(--muted) !important; text-decoration: line-through; }
+.tabs { display: flex; gap: 16px; padding-bottom: 8px; border-bottom: 1px solid var(--line); }
 .fc-event.ev-problem { outline: 2px solid var(--danger); outline-offset: -2px; }
 .fc-event.ev-absence { background: transparent !important; border: 1px dashed var(--absence) !important; }
 .fc-event.ev-absence .fc-event-title, .fc-event.ev-absence .fc-event-main { color: var(--absence) !important; }
@@ -168,3 +174,4 @@ table.simple td, table.simple th { padding: 6px 4px; border-bottom: 1px solid va
   .grid2 { grid-template-columns: 1fr; }
   .fc .fc-toolbar { flex-direction: column; gap: 8px; }
 }
+#people-block h3 { margin-top: 18px; }

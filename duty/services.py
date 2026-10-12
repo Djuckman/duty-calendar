@@ -29,6 +29,7 @@ from .integrations.publishers import Attendee, CalendarPublisher, PublishShift, 
 from .models import (
     Absence,
     ApiToken,
+    CalendarEvent,
     Holiday,
     Membership,
     Person,
@@ -493,7 +494,7 @@ class DutyService:
         q = (
             select(Shift)
             .options(selectinload(Shift.assignments).selectinload(ShiftAssignment.person), selectinload(Shift.team))
-            .where(Shift.deleted.is_(False), Shift.start < end, Shift.end > start)
+            .where(Shift.deleted.is_(False), Shift.cancelled.is_(False), Shift.start < end, Shift.end > start)
             .order_by(Shift.start)
         )
         if team_slug:
@@ -685,13 +686,19 @@ class DutyService:
         kinds = self.day_kinds(s, min(team.anchor_date, now.date()) - timedelta(days=1), window_end.date())
         slots = generate_slots(rule_for(team), now, window_end, kinds.get)
 
-        shifts = list(s.scalars(
+        # смены по графику ищем по слоту сетки (даты могли поменять вручную, а смену — снять)
+        recent = now - timedelta(days=team.shift_length_days * 2 + 7)
+        rows = list(s.scalars(
             select(Shift).options(selectinload(Shift.assignments))
-            .where(Shift.team_id == team.id, Shift.deleted.is_(False), Shift.end > now, Shift.start < window_end)
+            .where(Shift.team_id == team.id, Shift.deleted.is_(False), Shift.manual.is_(False),
+                   self._slot_key() >= recent, self._slot_key() < window_end)
         ))
+        cancelled = {sh.slot_start or sh.start for sh in rows if sh.cancelled}
+        slots = [sl for sl in slots if sl.start not in cancelled]  # снятые вручную дни остаются без дежурства
+        shifts = [sh for sh in rows if not sh.cancelled and (sh.end > now or sh.custom_period)]
         existing = [
-            ExistingShift(sh.id, sh.start, sh.end,
-                          tuple(ExistingSeat(a.seat, a.person_id, a.pinned) for a in sh.assignments), sh.manual)
+            ExistingShift(sh.id, sh.slot_start or sh.start, sh.end,
+                          tuple(ExistingSeat(a.seat, a.person_id, a.pinned) for a in sh.assignments))
             for sh in shifts
         ]
         members = [MemberInfo(m.person_id, m.position, m.active) for m in team.memberships]
@@ -712,8 +719,9 @@ class DutyService:
         count: dict[int, int] = {}
         hist = s.execute(
             select(ShiftAssignment.person_id, Shift.start).join(Shift)
-            .where(Shift.team_id == team.id, Shift.deleted.is_(False), Shift.end <= now,
-                   Shift.start >= now - timedelta(days=HISTORY_DAYS), ShiftAssignment.person_id.is_not(None))
+            .where(Shift.team_id == team.id, Shift.deleted.is_(False), Shift.cancelled.is_(False), Shift.end <= now,
+                   Shift.start >= now - timedelta(days=HISTORY_DAYS), ShiftAssignment.person_id.is_not(None),
+                   Shift.manual.is_(False))
         )
         for pid, start in hist:
             last[pid] = max(last.get(pid, start), start)
@@ -737,6 +745,12 @@ class DutyService:
             raise Invalid(str(exc)) from exc
         return result, {sh.id: sh for sh in shifts}
 
+    @staticmethod
+    def _slot_key():
+        from sqlalchemy import func
+
+        return func.coalesce(Shift.slot_start, Shift.start)
+
     def _apply(self, op: Op, team: Team, result: PlanResult, by_id: dict[int, Shift]) -> dict[datetime, Shift]:
         s = op.session
         reasons = {(c.start, c.seat): c.reason for c in result.changes}
@@ -759,9 +773,10 @@ class DutyService:
             if ps.existing_id is not None:
                 sh = by_id[ps.existing_id]
             else:
-                sh = s.scalar(select(Shift).where(Shift.team_id == team.id, Shift.start == ps.start))
+                sh = s.scalar(select(Shift).where(Shift.team_id == team.id, self._slot_key() == ps.start,
+                                                  Shift.manual.is_(False)))
                 if sh is None:
-                    sh = Shift(team_id=team.id, start=ps.start, end=ps.end)
+                    sh = Shift(team_id=team.id, start=ps.start, end=ps.end, slot_start=ps.start)
                     s.add(sh)
                 else:  # ранее удалённая смена на том же месте сетки
                     sh.deleted = False
@@ -773,7 +788,9 @@ class DutyService:
             current = {a.seat: a for a in sh.assignments}
             desired = {p.seat: p for p in ps.seats}
             changed = created
-            if sh.end != ps.end:
+            if sh.slot_start is None:
+                sh.slot_start = ps.start
+            if not sh.custom_period and sh.end != ps.end:  # даты, изменённые вручную, не трогаем
                 sh.end = ps.end
                 changed = True
             for seat, p in desired.items():
@@ -973,39 +990,13 @@ class DutyService:
         s.flush()
         return absence, [self._replan(op, t, "fix") for t in teams]
 
-    # ------------------------------------------------------------ ручные смены
+    # ------------------------------------------------------------ ручные дежурства (слои поверх графика)
 
-    def create_manual_shift(
-        self,
-        op: Op,
-        slug: str,
-        start_date: str | date,
-        days: int,
-        emails: list[str],
-        force: bool = False,
-    ) -> tuple[Shift, PlanReport]:
-        """Дежурство на произвольный период (N календарных дней от start_date, передача в handoff_time).
-        Период вырезается из сетки ротации: соседние смены укорачиваются, люди в них не меняются."""
-        s = op.session
-        team = self.get_team(s, slug)
-        if isinstance(start_date, str):
-            try:
-                start_date = date.fromisoformat(start_date.strip()[:10])
-            except ValueError as exc:
-                raise Invalid(f"не удалось разобрать дату {start_date!r}") from exc
-        if not 1 <= days <= 366:
-            raise Invalid("days: от 1 до 366")
+    def _check_people(self, s: Session, team: Team, emails: list[str], st: datetime, en: datetime,
+                      force: bool) -> list[Person]:
         emails = [norm_email(e) for e in emails if e and e.strip()]
         if not emails or len(set(emails)) != len(emails):
             raise Invalid("укажите одного или нескольких разных людей")
-        tz = ZoneInfo(team.timezone)
-        handoff = time.fromisoformat(team.handoff_time)
-        st = datetime.combine(start_date, handoff, tz).astimezone(UTC)
-        en = datetime.combine(start_date + timedelta(days=days), handoff, tz).astimezone(UTC)
-        now = self.now()
-        if en <= now:
-            raise Invalid("этот период уже прошёл")
-
         people = []
         for e in emails:
             p = self.get_person(s, e)
@@ -1019,69 +1010,188 @@ class DutyService:
                         "Чтобы назначить всё равно, повторите с force=true"
                     )
             people.append(p)
+        return people
 
-        overlapping = list(s.scalars(
-            select(Shift).options(selectinload(Shift.assignments))
-            .where(Shift.team_id == team.id, Shift.deleted.is_(False), Shift.start < en, Shift.end > st)
-        ))
-        for sh in overlapping:
-            if sh.manual and sh.start != st:
-                raise ConflictError(f"пересекается с ручной сменой {fmt_range(sh.start, sh.end, team.timezone)} — "
-                                    "сначала удалите её")
-            if st < sh.start < en and any(a.pinned for a in sh.assignments):
-                raise ConflictError(f"в этом периоде есть закреплённая смена {fmt_range(sh.start, sh.end, team.timezone)}"
-                                    " — сначала открепите её")
+    def manual_period(self, team: Team, start_date: str | date, days: int) -> tuple[datetime, datetime]:
+        if isinstance(start_date, str):
+            try:
+                start_date = date.fromisoformat(start_date.strip()[:10])
+            except ValueError as exc:
+                raise Invalid(f"не удалось разобрать дату {start_date!r}") from exc
+        if not 1 <= days <= 366:
+            raise Invalid("days: от 1 до 366")
+        tz = ZoneInfo(team.timezone)
+        handoff = time.fromisoformat(team.handoff_time)
+        return (datetime.combine(start_date, handoff, tz).astimezone(UTC),
+                datetime.combine(start_date + timedelta(days=days), handoff, tz).astimezone(UTC))
 
-        # смены, начинающиеся внутри периода (кроме совпадающей по началу), заменяются ручной
-        for sh in overlapping:
-            if st < sh.start < en:
-                for a in sh.assignments:
-                    if a.person_id is not None:
-                        self._log(op, sh, a.seat, a.person_id, None, "manual")
-                if sh.external_id:
-                    sh.deleted, sh.publish_dirty = True, True
-                else:
-                    s.delete(sh)
+    def create_manual_shift(
+        self,
+        op: Op,
+        slug: str,
+        start_date: str | date,
+        days: int,
+        emails: list[str],
+        force: bool = False,
+    ) -> Shift:
+        """Ручное дежурство на N календарных дней от start_date (передача в handoff_time команды).
+        Это отдельный слой поверх графика ротации: график не меняется, слоёв может быть несколько."""
+        s = op.session
+        team = self.get_team(s, slug)
+        st, en = self.manual_period(team, start_date, days)
+        if en <= self.now():
+            raise Invalid("этот период уже прошёл")
+        people = self._check_people(s, team, emails, st, en, force)
+        shift = Shift(team_id=team.id, start=st, end=en, manual=True)
+        s.add(shift)
         s.flush()
-
-        shift = s.scalar(select(Shift).where(Shift.team_id == team.id, Shift.start == st))
-        if shift is None:
-            shift = Shift(team_id=team.id, start=st, end=en, manual=True)
-            s.add(shift)
-            s.flush()
-        else:
-            for a in list(shift.assignments):
-                if a.person_id is not None:
-                    self._log(op, shift, a.seat, a.person_id, None, "manual")
-                shift.assignments.remove(a)
-            s.flush()
-            shift.deleted, shift.manual, shift.end = False, True, en
         for i, p in enumerate(people):
             shift.assignments.append(ShiftAssignment(seat=i, person_id=p.id, pinned=True))
             self._log(op, shift, i, None, p.id, "manual")
         shift.publish_dirty = True
         s.flush()
-        report = self._replan(op, team, "fix", notify=False)
-        self._notify_manual(op, team, shift, f"вручную назначил {mentions(people)}")
-        return shift, report
+        self._notify_manual(op, team, shift, f"добавил дежурство {mentions(people)}")
+        return shift
 
-    def delete_shift(self, op: Op, shift_id: int) -> PlanReport:
-        """Удалить ручную смену: её период возвращается в сетку ротации."""
+    def set_shift_period(self, op: Op, shift_id: int, start, end, force: bool = False) -> Shift:
+        """Изменить даты дежурства. У смены по графику меняются только её даты — ротация дальше не сдвигается
+        (соседние смены остаются как есть); вернуть даты графика — reset_shift_period()."""
         s = op.session
         shift = self.get_shift(s, shift_id)
-        if not shift.manual:
-            raise Invalid("это смена по графику ротации — её нельзя удалить, можно назначить другого или освободить место")
         self._check_editable(shift)
         team = shift.team
+        start, end = self.parse_moment(start), self.parse_moment(end)
+        if end <= start:
+            raise Invalid("конец должен быть позже начала")
+        if end <= self.now():
+            raise Invalid("новый период уже прошёл")
+        people = [a.person for a in shift.assignments if a.person]
+        if people and not force:
+            self._check_people(s, team, [p.email for p in people], start, end, False)
+        old = fmt_range(shift.start, shift.end, team.timezone)
+        if not shift.manual:
+            if shift.slot_start is None:
+                shift.slot_start = shift.start
+            shift.custom_period = True
+        shift.start, shift.end = start, end
+        shift.publish_dirty = True
+        self._log(op, shift, 0, None, None, "period")
+        s.flush()
+        self._notify_manual(op, team, shift, f"изменил даты дежурства {mentions(people)} (было {old})")
+        return shift
+
+    def reset_shift_period(self, op: Op, shift_id: int) -> Shift:
+        """Вернуть смене по графику даты из сетки ротации."""
+        s = op.session
+        shift = self.get_shift(s, shift_id)
+        if shift.manual:
+            raise Invalid("у ручного дежурства нет дат графика")
+        self._check_editable(shift)
+        if shift.custom_period:
+            shift.custom_period = False
+            if shift.slot_start is not None:
+                shift.start = shift.slot_start
+            shift.publish_dirty = True
+            s.flush()
+            self._replan(op, shift.team, "fix")  # конец восстановит планировщик
+        return shift
+
+    def delete_shift(self, op: Op, shift_id: int) -> None:
+        """Удалить дежурство. Ручное удаляется совсем; смена по графику снимается — эти дни остаются
+        без дежурного, планировщик их не заполняет (вернуть — restore_shift)."""
+        s = op.session
+        shift = self.get_shift(s, shift_id)
+        self._check_editable(shift)
+        team = shift.team
+        people = [a.person for a in shift.assignments if a.person]
         for a in shift.assignments:
             if a.person_id is not None:
                 self._log(op, shift, a.seat, a.person_id, None, "manual")
-        if shift.external_id:
-            shift.deleted, shift.publish_dirty = True, True
+        if shift.manual:
+            if shift.external_id:
+                shift.deleted, shift.publish_dirty = True, True
+            else:
+                s.delete(shift)
         else:
-            s.delete(shift)
+            shift.cancelled, shift.publish_dirty = True, True
+            if shift.slot_start is None:
+                shift.slot_start = shift.start
         s.flush()
-        return self._replan(op, team, "fix")
+        self._notify_manual(op, team, shift, f"снял дежурство {mentions(people)}")
+
+    def list_cancelled(self, s: Session, start: datetime, end: datetime, team_slug: str | None = None) -> list[Shift]:
+        q = (select(Shift).options(selectinload(Shift.team), selectinload(Shift.assignments))
+             .where(Shift.cancelled.is_(True), Shift.deleted.is_(False), Shift.start < end, Shift.end > start))
+        if team_slug:
+            q = q.where(Shift.team_id == self.get_team(s, team_slug).id)
+        return list(s.scalars(q))
+
+    def restore_shift(self, op: Op, shift_id: int) -> Shift:
+        """Вернуть снятую смену по графику: даты из сетки, дежурного назначит планировщик."""
+        s = op.session
+        shift = s.get(Shift, shift_id)
+        if shift is None or not shift.cancelled:
+            raise NotFound("снятая смена не найдена")
+        shift.cancelled, shift.custom_period = False, False
+        if shift.slot_start is not None:
+            shift.start = shift.slot_start
+        for a in shift.assignments:
+            a.pinned = False
+        shift.publish_dirty = True
+        s.flush()
+        self._replan(op, shift.team, "fix")
+        return shift
+
+    # ------------------------------------------------------------ события (не дежурства)
+
+    def list_events(self, s: Session, start: datetime, end: datetime, team_slugs: list[str] | None = None):
+        q = (select(CalendarEvent).options(selectinload(CalendarEvent.team))
+             .where(CalendarEvent.start < end, CalendarEvent.end > start).order_by(CalendarEvent.start))
+        events = list(s.scalars(q))
+        if team_slugs:
+            events = [e for e in events if e.team is None or e.team.slug in team_slugs]
+        return events
+
+    def _event_fields(self, s: Session, ev: CalendarEvent, data: dict) -> None:
+        if "team" in data:
+            ev.team_id = self.get_team(s, data["team"]).id if data["team"] else None
+        if data.get("title") is not None:
+            if not data["title"].strip():
+                raise Invalid("название события не может быть пустым")
+            ev.title = data["title"].strip()
+        if data.get("description") is not None:
+            ev.description = data["description"]
+        if data.get("color"):
+            if not re.fullmatch(r"#[0-9a-fA-F]{6}", data["color"]):
+                raise Invalid("color: #RRGGBB")
+            ev.color = data["color"]
+        if data.get("start") is not None:
+            ev.start = self.parse_moment(data["start"])
+        if data.get("end") is not None:
+            ev.end = self.parse_moment(data["end"], end=True)
+        if ev.start is None or ev.end is None or ev.end <= ev.start:
+            raise Invalid("конец события должен быть позже начала")
+
+    def create_event(self, op: Op, data: dict) -> CalendarEvent:
+        ev = CalendarEvent(created_by=op.actor_name, description="", color="#e5a50a")
+        self._event_fields(op.session, ev, data)
+        op.session.add(ev)
+        op.session.flush()
+        return ev
+
+    def update_event(self, op: Op, event_id: int, data: dict) -> CalendarEvent:
+        ev = op.session.get(CalendarEvent, event_id)
+        if ev is None:
+            raise NotFound(f"событие {event_id} не найдено")
+        self._event_fields(op.session, ev, data)
+        op.session.flush()
+        return ev
+
+    def delete_event(self, op: Op, event_id: int) -> None:
+        ev = op.session.get(CalendarEvent, event_id)
+        if ev is None:
+            raise NotFound(f"событие {event_id} не найдено")
+        op.session.delete(ev)
 
     def delete_absence(self, op: Op, absence_id: int, dry_run: bool = False) -> list[PlanReport]:
         s = op.session
@@ -1217,6 +1327,10 @@ class DutyService:
                         if sh.external_id:
                             self.publisher.unpublish(pteam, sh.external_id)
                         s.delete(sh)
+                    elif sh.cancelled:
+                        if sh.external_id:
+                            self.publisher.unpublish(pteam, sh.external_id)
+                        sh.external_id, sh.publish_dirty = None, False
                     elif sh.end <= now - timedelta(days=1):
                         sh.publish_dirty = False  # прошлое не публикуем
                     else:
@@ -1240,19 +1354,25 @@ class DutyService:
             now = self.now()
             for team in self.list_teams(s):
                 current = self.oncall(s, team.slug, now)
-                if not current:
+                grid = [x for x in current if not x.manual]
+                if not grid:
                     continue
-                sh = current[0]
+                sh = grid[0]
                 if team.last_announced_shift_id == sh.id:
                     continue
                 team.last_announced_shift_id = sh.id
                 people = [a.person for a in sh.assignments]
+                extra = [a.person for x in current if x.manual for a in x.assignments if a.person]
                 nxt = s.scalar(
                     select(Shift).options(selectinload(Shift.assignments).selectinload(ShiftAssignment.person))
-                    .where(Shift.team_id == team.id, Shift.deleted.is_(False), Shift.start >= sh.end)
+                    .where(Shift.team_id == team.id, Shift.deleted.is_(False), Shift.manual.is_(False),
+                           Shift.cancelled.is_(False),
+                           Shift.start >= sh.end)
                     .order_by(Shift.start).limit(1)
                 )
                 text = f"🟢 **{team.name}**: началась смена до {fmt_dt(sh.end, team.timezone)}. Дежурит: {mentions(people)}"
+                if extra:
+                    text += f" (+ вручную: {mentions(extra)})"
                 if nxt is not None:
                     text += (f"\nСледующая смена с {fmt_dt(nxt.start, team.timezone)}: "
                              f"{mentions([a.person for a in nxt.assignments])}")

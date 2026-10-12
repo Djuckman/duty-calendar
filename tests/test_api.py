@@ -214,24 +214,61 @@ def _rows(admin, team, start="2026-10-01T00:00:00Z", end="2026-11-20T00:00:00Z")
     return out
 
 
-def test_manual_shift_one_day_inside_week(team, admin):
-    # неделя 12.10–19.10 у Бори; вручную ставим Аню на 14.10 (1 день)
+def test_manual_shift_is_overlay(team, admin):
+    # неделя 12.10–19.10 у Бори; ручное дежурство Ани на 14.10 — слой поверх, график не меняется
     r = admin.post("/api/v1/teams/sec/shifts", json={"start_date": "2026-10-14", "days": 1, "emails": ["a@x.ru"]})
     assert r.status_code == 201, r.text
     rows = [x[:4] for x in _rows(admin, "sec", end="2026-10-18T00:00:00Z")]
-    assert rows[1:] == [("12.10", "14.10", ["Боря"], False), ("14.10", "15.10", ["Аня"], True),
-                        ("15.10", "19.10", ["Боря"], False)]
-    # пересекающуюся ручную смену создать нельзя
-    r = admin.post("/api/v1/teams/sec/shifts", json={"start_date": "2026-10-13", "days": 2, "emails": ["b@x.ru"]})
-    assert r.status_code == 409
-    # удаление ручной смены возвращает период в сетку
+    assert rows[1:] == [("12.10", "19.10", ["Боря"], False), ("14.10", "15.10", ["Аня"], True)]
+    # второй слой в тот же день тоже можно
+    r = admin.post("/api/v1/teams/sec/shifts", json={"start_date": "2026-10-14", "days": 2, "emails": ["c@x.ru"]})
+    assert r.status_code == 201, r.text
+    assert len([x for x in _rows(admin, "sec") if x[3]]) == 2
+    # удалить ручное дежурство
     manual_id = [x for x in _rows(admin, "sec") if x[3]][0][4]
-    assert admin.delete(f"/api/v1/shifts/{manual_id}").status_code == 200
-    rows = [x[:4] for x in _rows(admin, "sec", end="2026-10-18T00:00:00Z")]
-    assert rows[1:] == [("12.10", "19.10", ["Боря"], False)]
-    # обычную смену удалить нельзя
-    grid_id = _rows(admin, "sec")[0][4]
-    assert admin.delete(f"/api/v1/shifts/{grid_id}").status_code == 422
+    assert admin.delete(f"/api/v1/shifts/{manual_id}").status_code == 204
+    assert len([x for x in _rows(admin, "sec") if x[3]]) == 1
+
+
+def test_change_dates_of_grid_shift_keeps_rotation(team, admin):
+    rows = _rows(admin, "sec")
+    sid = rows[1][4]  # 12.10–19.10 Боря
+    r = admin.patch(f"/api/v1/shifts/{sid}", json={"start": "2026-10-12T07:00:00Z", "end": "2026-10-15T07:00:00Z"})
+    assert r.status_code == 200, r.text
+    assert r.json()["custom_period"] is True
+    admin.post("/api/v1/teams/sec/plan")  # планировщик не возвращает старые даты и не создаёт смену на пустые дни
+    rows = [x[:3] for x in _rows(admin, "sec", end="2026-10-26T00:00:00Z")]
+    assert rows[1:] == [("12.10", "15.10", ["Боря"]), ("19.10", "26.10", ["Вика"])]
+    r = admin.post(f"/api/v1/shifts/{sid}/reset-period")
+    assert r.status_code == 200 and r.json()["custom_period"] is False
+    assert [x[:3] for x in _rows(admin, "sec", end="2026-10-18T00:00:00Z")][1] == ("12.10", "19.10", ["Боря"])
+
+
+def test_delete_grid_shift_leaves_gap_and_restore(team, admin, notifier):
+    sid = _rows(admin, "sec")[1][4]
+    assert admin.delete(f"/api/v1/shifts/{sid}").status_code == 204
+    admin.post("/api/v1/teams/sec/plan", params={"mode": "rebalance"})
+    rows = [x[:3] for x in _rows(admin, "sec", end="2026-10-26T00:00:00Z")]
+    assert [r[0] for r in rows] == ["05.10", "19.10"]  # неделя 12.10 пустая
+    cal = admin.get("/api/v1/calendar", params={"start": "2026-10-01T00:00:00Z", "end": "2026-10-31T00:00:00Z"}).json()
+    assert [c["id"] for c in cal["cancelled"]] == [sid]
+    r = admin.post(f"/api/v1/shifts/{sid}/restore")
+    assert r.status_code == 200 and r.json()["seats"][0]["person"] is not None
+    assert len(_rows(admin, "sec", end="2026-10-26T00:00:00Z")) == 3
+
+
+def test_events_crud(team, admin):
+    r = admin.post("/api/v1/events", json={"title": "Релиз", "start": "2026-10-20", "end": "2026-10-20",
+                                           "team": "sec", "color": "#8a3ffc"})
+    assert r.status_code == 201, r.text
+    ev = r.json()
+    assert ev["all_day"] and ev["start_day"] == ev["end_day"] == "2026-10-20"
+    r = admin.patch(f"/api/v1/events/{ev['id']}", json={"end": "2026-10-21", "title": "Релиз 2.0"})
+    assert r.json()["end_day"] == "2026-10-21" and r.json()["title"] == "Релиз 2.0"
+    cal = admin.get("/api/v1/calendar", params={"start": "2026-10-01T00:00:00Z", "end": "2026-10-31T00:00:00Z"}).json()
+    assert [e["title"] for e in cal["events"]] == ["Релиз 2.0"]
+    assert admin.post("/api/v1/events", json={"title": "x", "start": "2026-10-21", "end": "2026-10-20"}).status_code == 422
+    assert admin.delete(f"/api/v1/events/{ev['id']}").status_code == 204
 
 
 def test_manual_shift_several_people_and_absence_check(team, admin):
@@ -241,7 +278,7 @@ def test_manual_shift_several_people_and_absence_check(team, admin):
     assert r.status_code == 409 and "отсутствует" in r.json()["detail"]
     r = admin.post("/api/v1/teams/sec/shifts", json={**body, "force": True})
     assert r.status_code == 201
-    assert [s["person"]["name"] for s in r.json()["shift"]["seats"]] == ["Боря", "Вика"]
+    assert [s["person"]["name"] for s in r.json()["seats"]] == ["Боря", "Вика"]
 
 
 def test_update_absence(team, admin):
@@ -272,3 +309,29 @@ def test_auto_migration_adds_column(tmp_path):
     init_db(f"sqlite:///{path}")
     con = sqlite3.connect(path)
     assert con.execute("SELECT manual FROM shifts WHERE id = 1").fetchone() == (0,)
+
+
+def test_migration_drops_shift_unique_and_keeps_assignments(tmp_path):
+    import sqlite3
+
+    from duty.db import init_db
+
+    path = tmp_path / "old2.db"
+    con = sqlite3.connect(path)
+    con.executescript("""
+        CREATE TABLE shifts (id INTEGER PRIMARY KEY, team_id INTEGER, start DATETIME, "end" DATETIME,
+            deleted BOOLEAN, external_id VARCHAR(512), publish_dirty BOOLEAN, updated_at DATETIME,
+            UNIQUE (team_id, start));
+        CREATE TABLE shift_assignments (id INTEGER PRIMARY KEY, shift_id INTEGER REFERENCES shifts(id) ON DELETE CASCADE,
+            seat INTEGER, person_id INTEGER, pinned BOOLEAN, UNIQUE (shift_id, seat));
+        INSERT INTO shifts (id, team_id, start, "end", deleted, publish_dirty, updated_at) VALUES (1, 1, '2026-10-12 07:00:00', '2026-10-19 07:00:00', 0, 0, '2026-10-01 00:00:00');
+        INSERT INTO shift_assignments (id, shift_id, seat, person_id, pinned) VALUES (1, 1, 0, 5, 0);
+    """)
+    con.commit()
+    con.close()
+    init_db(f"sqlite:///{path}")
+    con = sqlite3.connect(path)
+    assert con.execute("SELECT count(*) FROM shift_assignments").fetchone() == (1,)
+    con.execute("INSERT INTO shifts (id, team_id, start, \"end\", deleted, publish_dirty, manual, custom_period, cancelled, "
+                "updated_at) VALUES (2, 1, '2026-10-12 07:00:00', '2026-10-13 07:00:00', 0, 0, 1, 0, 0, '2026-10-01')")  # тот же start — теперь можно
+    con.commit()

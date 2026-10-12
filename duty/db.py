@@ -60,6 +60,7 @@ def init_db(url: str) -> Engine:
 
     Base.metadata.create_all(_engine)
     _add_missing_columns(_engine)
+    _drop_shift_unique(_engine)
     _SessionLocal = sessionmaker(_engine, expire_on_commit=False)
     return _engine
 
@@ -90,6 +91,37 @@ def _add_missing_columns(engine: Engine) -> None:
                 else:
                     default_sql = ""
                 conn.execute(text(f'ALTER TABLE {table.name} ADD COLUMN {col.name} {ddl_type}{default_sql}'))
+
+
+def _drop_shift_unique(engine: Engine) -> None:
+    """Мини-миграция: снять UNIQUE(team_id, start) с shifts (ручные дежурства — слои поверх сетки)."""
+    from sqlalchemy import inspect, text
+    from sqlalchemy.schema import CreateIndex, CreateTable
+
+    insp = inspect(engine)
+    if not insp.has_table("shifts"):
+        return
+    uniques = [u for u in insp.get_unique_constraints("shifts") if sorted(u["column_names"]) == ["start", "team_id"]]
+    if not uniques:
+        return
+    table = Base.metadata.tables["shifts"]
+    if engine.dialect.name != "sqlite":
+        with engine.begin() as conn:
+            for u in uniques:
+                conn.execute(text(f'ALTER TABLE shifts DROP CONSTRAINT "{u["name"]}"'))
+        return
+    # SQLite не умеет DROP CONSTRAINT: пересоздаём таблицу
+    cols = ", ".join(f'"{c.name}"' for c in table.columns)
+    ddl = str(CreateTable(table).compile(dialect=engine.dialect)).replace("CREATE TABLE shifts", "CREATE TABLE shifts_new", 1)
+    with engine.begin() as conn:
+        conn.exec_driver_sql("PRAGMA foreign_keys=OFF")
+        conn.exec_driver_sql(ddl)
+        conn.exec_driver_sql(f"INSERT INTO shifts_new ({cols}) SELECT {cols} FROM shifts")
+        conn.exec_driver_sql("DROP TABLE shifts")
+        conn.exec_driver_sql("ALTER TABLE shifts_new RENAME TO shifts")
+        for idx in table.indexes:
+            conn.exec_driver_sql(str(CreateIndex(idx).compile(dialect=engine.dialect)))
+        conn.exec_driver_sql("PRAGMA foreign_keys=ON")
 
 
 def get_engine() -> Engine:

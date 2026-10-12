@@ -121,6 +121,8 @@ class ShiftOut(BaseModel):
     end: datetime
     people_per_shift: int
     manual: bool = False
+    custom_period: bool = False  # даты смены по графику изменены вручную
+    slot_start: datetime | None = None
     seats: list[SeatOut]
 
 
@@ -133,6 +135,8 @@ def shift_out(sh: Shift) -> ShiftOut:
         end=sh.end,
         people_per_shift=sh.team.people_per_shift,
         manual=sh.manual,
+        custom_period=sh.custom_period,
+        slot_start=sh.slot_start,
         seats=[
             SeatOut(seat=a.seat, person=PersonOut.model_validate(a.person) if a.person else None, pinned=a.pinned)
             for a in sorted(sh.assignments, key=lambda a: a.seat)
@@ -153,9 +157,10 @@ class ManualShiftIn(BaseModel):
     force: bool = Field(False, description="Назначить, даже если кто-то отсутствует")
 
 
-class ManualShiftResult(BaseModel):
-    shift: "ShiftOut"
-    plan: "PlanReportOut"
+class ShiftPeriodIn(BaseModel):
+    start: datetime = Field(description="Новое начало (ISO 8601)")
+    end: datetime = Field(description="Новый конец (ISO 8601)")
+    force: bool = Field(False, description="Сохранить, даже если кто-то из дежурных отсутствует")
 
 
 class UnpinIn(BaseModel):
@@ -299,10 +304,63 @@ class HolidayIn(BaseModel):
     kind: Literal["holiday", "dayoff", "workday", "short"] = "holiday"
 
 
+class EventIn(BaseModel):
+    title: str
+    start: str = Field(description="YYYY-MM-DD (с начала дня) или дата-время ISO 8601")
+    end: str = Field(description="YYYY-MM-DD (включительно) или дата-время ISO 8601 (не включительно)")
+    description: str = ""
+    color: str = "#e5a50a"
+    team: str | None = Field(None, description="slug команды; null — событие для всех")
+
+
+class EventPatch(BaseModel):
+    title: str | None = None
+    start: str | None = None
+    end: str | None = None
+    description: str | None = None
+    color: str | None = None
+    team: str | None = None
+
+
+class EventOut(BaseModel):
+    id: int
+    title: str
+    description: str
+    start: datetime
+    end: datetime
+    all_day: bool
+    start_day: date | None
+    end_day: date | None
+    color: str
+    team: str | None
+    created_by: str
+
+
+def _days(start: datetime, end: datetime):
+    from datetime import timedelta
+    from zoneinfo import ZoneInfo
+
+    from .config import get_settings
+
+    tz = ZoneInfo(get_settings().timezone)
+    ls, le = start.astimezone(tz), end.astimezone(tz)
+    all_day = ls.time() == le.time() == datetime.min.time()
+    return all_day, (ls.date() if all_day else None), ((le.date() - timedelta(days=1)) if all_day else None)
+
+
+def event_out(e) -> EventOut:
+    all_day, sd, ed = _days(e.start, e.end)
+    return EventOut(id=e.id, title=e.title, description=e.description, start=e.start, end=e.end, all_day=all_day,
+                    start_day=sd, end_day=ed, color=e.color, team=e.team.slug if e.team else None,
+                    created_by=e.created_by)
+
+
 class CalendarOut(BaseModel):
     shifts: list[ShiftOut]
     absences: list[AbsenceOut]
     holidays: list[HolidayOut]
+    events: list[EventOut] = []
+    cancelled: list[ShiftOut] = []  # снятые вручную смены по графику (можно вернуть)
 
 
 # ---------------------------------------------------------------- пользователи
@@ -365,7 +423,5 @@ def user_out(u: User) -> UserOut:
 def holiday_out(h: Holiday) -> HolidayOut:
     return HolidayOut.model_validate(h)
 
-
-ManualShiftResult.model_rebuild()
 
 __all__ = [n for n in dir() if not n.startswith("_")] + ["ChangeView", "ConflictView"]

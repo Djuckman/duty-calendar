@@ -276,19 +276,39 @@ def assign(shift_id: int, data: S.AssignIn, user: CurrentUser, svc: Svc):
         return S.shift_out(svc.assign(op, shift_id, data.email, data.seat, data.force))
 
 
-@router.post("/teams/{slug}/shifts", response_model=S.ManualShiftResult, status_code=201, tags=["shifts"])
+@router.post("/teams/{slug}/shifts", response_model=S.ShiftOut, status_code=201, tags=["shifts"])
 def create_manual_shift(slug: str, data: S.ManualShiftIn, user: CurrentUser, svc: Svc):
-    """Ручное дежурство на N календарных дней (вырезается из сетки ротации)."""
+    """Ручное дежурство на N календарных дней — слой поверх графика ротации (график не меняется)."""
     with svc.write(user) as op:
-        shift, report = svc.create_manual_shift(op, slug, data.start_date, data.days, data.emails, data.force)
-        return S.ManualShiftResult(shift=S.shift_out(shift), plan=S.report_out(report))
+        return S.shift_out(svc.create_manual_shift(op, slug, data.start_date, data.days, data.emails, data.force))
 
 
-@router.delete("/shifts/{shift_id}", response_model=S.PlanReportOut, tags=["shifts"])
+@router.patch("/shifts/{shift_id}", response_model=S.ShiftOut, tags=["shifts"])
+def set_shift_period(shift_id: int, data: S.ShiftPeriodIn, user: CurrentUser, svc: Svc):
+    """Изменить даты дежурства (у смены по графику ротация дальше не сдвигается)."""
+    with svc.write(user) as op:
+        return S.shift_out(svc.set_shift_period(op, shift_id, data.start, data.end, data.force))
+
+
+@router.post("/shifts/{shift_id}/reset-period", response_model=S.ShiftOut, tags=["shifts"])
+def reset_shift_period(shift_id: int, user: CurrentUser, svc: Svc):
+    """Вернуть смене по графику даты из сетки ротации."""
+    with svc.write(user) as op:
+        return S.shift_out(svc.reset_shift_period(op, shift_id))
+
+
+@router.delete("/shifts/{shift_id}", status_code=204, tags=["shifts"])
 def delete_shift(shift_id: int, user: CurrentUser, svc: Svc):
-    """Удалить ручную смену — период вернётся в сетку ротации."""
+    """Удалить дежурство. Смена по графику снимается: эти дни остаются без дежурного."""
     with svc.write(user) as op:
-        return S.report_out(svc.delete_shift(op, shift_id))
+        svc.delete_shift(op, shift_id)
+
+
+@router.post("/shifts/{shift_id}/restore", response_model=S.ShiftOut, tags=["shifts"])
+def restore_shift(shift_id: int, user: CurrentUser, svc: Svc):
+    """Вернуть снятую смену по графику."""
+    with svc.write(user) as op:
+        return S.shift_out(svc.restore_shift(op, shift_id))
 
 
 @router.post("/shifts/{shift_id}/unpin", response_model=S.ShiftOut, tags=["shifts"])
@@ -337,6 +357,35 @@ def delete_absence(absence_id: int, user: CurrentUser, svc: Svc, dry_run: bool =
     with svc.write(user) as op:
         reports = svc.delete_absence(op, absence_id, dry_run)
         return S.AbsenceResult(absence=None, plans=[S.report_out(r) for r in reports])
+
+
+# ---------------------------------------------------------------- события
+
+
+@router.get("/events", response_model=list[S.EventOut], tags=["events"])
+def list_events(user: CurrentUser, svc: Svc, start: datetime | None = None, end: datetime | None = None,
+                teams: Annotated[list[str] | None, Query()] = None):
+    st, en = _range(start, end)
+    with svc.read() as s:
+        return [S.event_out(e) for e in svc.list_events(s, st, en, teams)]
+
+
+@router.post("/events", response_model=S.EventOut, status_code=201, tags=["events"])
+def create_event(data: S.EventIn, user: CurrentUser, svc: Svc):
+    with svc.write(user) as op:
+        return S.event_out(svc.create_event(op, data.model_dump()))
+
+
+@router.patch("/events/{event_id}", response_model=S.EventOut, tags=["events"])
+def update_event(event_id: int, data: S.EventPatch, user: CurrentUser, svc: Svc):
+    with svc.write(user) as op:
+        return S.event_out(svc.update_event(op, event_id, data.model_dump(exclude_unset=True)))
+
+
+@router.delete("/events/{event_id}", status_code=204, tags=["events"])
+def delete_event(event_id: int, user: CurrentUser, svc: Svc):
+    with svc.write(user) as op:
+        svc.delete_event(op, event_id)
 
 
 # ---------------------------------------------------------------- праздники
@@ -395,6 +444,9 @@ def calendar(user: CurrentUser, svc: Svc, start: datetime, end: datetime,
             shifts=[S.shift_out(sh) for sh in shifts],
             absences=[S.absence_out(a) for a in absences],
             holidays=[S.holiday_out(h) for h in holidays],
+            events=[S.event_out(e) for e in svc.list_events(s, st, en, teams)],
+            cancelled=[S.shift_out(sh) for sh in svc.list_cancelled(s, st, en)
+                       if not teams or sh.team.slug in teams],
         )
 
 

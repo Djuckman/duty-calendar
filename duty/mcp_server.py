@@ -169,25 +169,107 @@ def build_mcp(svc: DutyService, resolve_user: Callable[[], User | None] = _heade
 
     @mcp.tool
     def set_manual_shift(team: str, start_date: str, days: int, emails: list[str], force: bool = False) -> dict:
-        """Назначить дежурство вручную на N календарных дней начиная с start_date (YYYY-MM-DD) одному или
-        нескольким людям. Период вырезается из сетки ротации, соседние смены укорачиваются."""
+        """Добавить ручное дежурство на N календарных дней начиная с start_date (YYYY-MM-DD) одному или
+        нескольким людям. Это слой поверх графика ротации — график не меняется."""
         u = user()
 
         def run():
             with svc.write(u) as op:
-                shift, report = svc.create_manual_shift(op, team, start_date, days, emails, force)
-                return _dump(S.ManualShiftResult(shift=S.shift_out(shift), plan=S.report_out(report)))
+                return _dump(S.shift_out(svc.create_manual_shift(op, team, start_date, days, emails, force)))
 
         return call(run)
 
     @mcp.tool
-    def delete_manual_shift(shift_id: int) -> dict:
-        """Удалить ручную смену — её период вернётся в сетку ротации."""
+    def set_shift_dates(shift_id: int, start: str, end: str, force: bool = False) -> dict:
+        """Изменить даты дежурства (ISO 8601 или YYYY-MM-DD). У смены по графику меняются только её даты,
+        ротация дальше не сдвигается."""
         u = user()
 
         def run():
             with svc.write(u) as op:
-                return _dump(S.report_out(svc.delete_shift(op, shift_id)))
+                return _dump(S.shift_out(svc.set_shift_period(op, shift_id, start, end, force)))
+
+        return call(run)
+
+    @mcp.tool
+    def reset_shift_dates(shift_id: int) -> dict:
+        """Вернуть смене по графику даты из сетки ротации."""
+        u = user()
+
+        def run():
+            with svc.write(u) as op:
+                return _dump(S.shift_out(svc.reset_shift_period(op, shift_id)))
+
+        return call(run)
+
+    @mcp.tool
+    def delete_shift(shift_id: int) -> str:
+        """Удалить дежурство. Ручное удаляется; смена по графику снимается — эти дни остаются без дежурного."""
+        u = user()
+
+        def run():
+            with svc.write(u) as op:
+                svc.delete_shift(op, shift_id)
+            return "ok"
+
+        return call(run)
+
+    @mcp.tool
+    def restore_shift(shift_id: int) -> dict:
+        """Вернуть снятую смену по графику (дежурного назначит планировщик)."""
+        u = user()
+
+        def run():
+            with svc.write(u) as op:
+                return _dump(S.shift_out(svc.restore_shift(op, shift_id)))
+
+        return call(run)
+
+    @mcp.tool(annotations={"readOnlyHint": True})
+    def list_events(start: str | None = None, end: str | None = None, team: str | None = None) -> list[dict]:
+        """События календаря (не дежурства) за период, по умолчанию ближайшие 30 дней."""
+        user()
+        st = _parse_dt(start, svc) or datetime.now(UTC)
+        en = _parse_dt(end, svc, end=True) or st + timedelta(days=30)
+        with svc.read() as s:
+            return _dump([S.event_out(e) for e in svc.list_events(s, st, en, [team] if team else None)])
+
+    @mcp.tool
+    def add_event(title: str, start: str, end: str, description: str = "", team: str | None = None,
+                  color: str = "#e5a50a") -> dict:
+        """Добавить событие (не дежурство). Даты 'YYYY-MM-DD' (конец включительно) или ISO 8601 с временем."""
+        u = user()
+
+        def run():
+            with svc.write(u) as op:
+                return _dump(S.event_out(svc.create_event(op, dict(title=title, start=start, end=end,
+                                                                  description=description, team=team, color=color))))
+
+        return call(run)
+
+    @mcp.tool
+    def update_event(event_id: int, title: str | None = None, start: str | None = None, end: str | None = None,
+                     description: str | None = None, color: str | None = None) -> dict:
+        """Изменить событие."""
+        u = user()
+        data = {k: v for k, v in dict(title=title, start=start, end=end, description=description, color=color).items()
+                if v is not None}
+
+        def run():
+            with svc.write(u) as op:
+                return _dump(S.event_out(svc.update_event(op, event_id, data)))
+
+        return call(run)
+
+    @mcp.tool
+    def delete_event(event_id: int) -> str:
+        """Удалить событие."""
+        u = user()
+
+        def run():
+            with svc.write(u) as op:
+                svc.delete_event(op, event_id)
+            return "ok"
 
         return call(run)
 

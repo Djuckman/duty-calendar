@@ -66,7 +66,6 @@ class ExistingShift:
     start: datetime
     end: datetime
     seats: tuple[ExistingSeat, ...] = ()
-    manual: bool = False  # период задан вручную (не по сетке): вырезается из сетки, места не трогаются
 
     @classmethod
     def single(cls, id: int, start: datetime, end: datetime, person_id: int | None, pinned: bool = False):
@@ -210,14 +209,11 @@ class WholeShiftPlanner(BasePlanner):
         now = data.now
 
         existing_by_start = {e.start: e for e in data.existing}
-        manual = [e for e in data.existing if e.manual]
-        slots = subtract_intervals(data.slots, [(e.start, e.end) for e in manual])
+        slots = data.slots
         slot_starts = {s.start for s in slots}
 
         # Смены, выпавшие из сетки (поменялись правила): будущие без закреплений — удаляем.
         for e in data.existing:
-            if e.manual:
-                continue
             if e.start not in slot_starts and e.start > now and not any(s.pinned for s in e.seats):
                 res.deletions.append(e.id)
                 for s in e.seats:
@@ -229,7 +225,7 @@ class WholeShiftPlanner(BasePlanner):
             s.start: (s, existing_by_start.get(s.start), True) for s in slots
         }
         for e in data.existing:
-            if e.manual or (e.start not in items and (e.start <= now or any(s.pinned for s in e.seats))):
+            if e.start not in items and (e.start <= now or any(s.pinned for s in e.seats)):
                 items[e.start] = (Slot(e.start, e.end), e, False)
 
         for start in sorted(items):
@@ -238,10 +234,7 @@ class WholeShiftPlanner(BasePlanner):
             started = start <= now
             frozen = data.freeze_until is not None and start < data.freeze_until
             old_seats = {s.seat: s for s in (ex.seats if ex else ())}
-            if ex is not None and ex.manual:
-                n_seats = len(old_seats)  # ручная смена: столько мест, сколько задали
-            else:
-                n_seats = data.seats if on_grid else 0
+            n_seats = data.seats if on_grid else 0
             seat_ids = sorted(set(range(n_seats)) | set(old_seats))
 
             planned: dict[int, PlannedSeat] = {}
@@ -313,28 +306,6 @@ class WholeShiftPlanner(BasePlanner):
             )
 
         return res
-
-
-def subtract_intervals(slots: list[Slot], cuts: list[tuple[datetime, datetime]]) -> list[Slot]:
-    """Вырезать из смен сетки интервалы ручных смен. Куски сохраняют group (тот же дежурный)."""
-    if not cuts:
-        return list(slots)
-    out: list[Slot] = []
-    for sl in slots:
-        pieces = [(sl.start, sl.end)]
-        for cs, ce in cuts:
-            nxt = []
-            for ps, pe in pieces:
-                if ce <= ps or cs >= pe:
-                    nxt.append((ps, pe))
-                    continue
-                if ps < cs:
-                    nxt.append((ps, cs))
-                if ce < pe:
-                    nxt.append((ce, pe))
-            pieces = nxt
-        out.extend(Slot(ps, pe, sl.group) for ps, pe in pieces if pe > ps)
-    return out
 
 
 class SplitShiftPlanner(BasePlanner):
